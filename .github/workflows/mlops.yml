@@ -2,7 +2,8 @@ name: MLOps Edge Security Pipeline - Feature Branch
 
 on:
   push:
-    branches: [ feature/add ]
+    branches: 
+      - feature/add
     paths:
       - 'app/**'
       - 'models.dvc'
@@ -10,6 +11,7 @@ on:
       - 'scripts/**'
       - 'requirements.txt'
       - 'setup.py'
+      - '.github/workflows/**'
 
   workflow_dispatch:
     inputs:
@@ -25,20 +27,18 @@ on:
 
 env:
   MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI || 'http://localhost:5000' }}
-  PYTHON_VERSION: '3.11'  # Mise à jour recommandée
+  PYTHON_VERSION: '3.11'
 
 jobs:
-  # ===========================================
-  # JOB 1: SETUP ET VALIDATION BRANCHE FEATURE
-  # ===========================================
   setup-and-validation:
     name: Setup et validation - Branche Feature
-    runs-on: ubuntu-latest-4-cores
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
       models_exist: ${{ steps.check-models.outputs.exist }}
       models_count: ${{ steps.check-models.outputs.count }}
       setup_success: ${{ steps.validate-setup.outputs.success }}
+    
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -188,17 +188,15 @@ jobs:
           
           python basic_test.py
 
-  # ===========================================
-  # JOB 2: BENCHMARK PERFORMANCE
-  # ===========================================
   performance-benchmark:
     name: Benchmark Performance
     needs: setup-and-validation
     if: needs.setup-and-validation.outputs.models_exist == 'true' && needs.setup-and-validation.outputs.setup_success == 'true'
-    runs-on: ubuntu-latest-4-cores
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     outputs:
       production_ready_count: ${{ steps.run-benchmark.outputs.production_ready_count }}
+    
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -246,7 +244,7 @@ jobs:
               try:
                   detector = EdgeDetector(model_path)
                   test_img = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-                  for _ in range(3): detector.predict(test_img)  # warm-up
+                  for _ in range(3): detector.predict(test_img)
                   
                   latencies = []
                   for _ in range(15):
@@ -272,7 +270,8 @@ jobs:
               json.dump(results, f, indent=2)
           
           ready_count = sum(r["meets_requirements"] for r in results)
-          echo "production_ready_count=$ready_count" >> $GITHUB_OUTPUT
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"production_ready_count={ready_count}\n")
           EOF
           
           python benchmark.py
@@ -284,15 +283,13 @@ jobs:
           path: benchmark_results.json
           retention-days: 7
 
-  # ===========================================
-  # JOB 3: ENREGISTREMENT MLFLOW (STAGING)
-  # ===========================================
   mlflow-registration-staging:
     name: Enregistrement MLflow - Staging
     needs: performance-benchmark
     if: success() && github.event.inputs.test_mode != 'benchmark-only'
-    runs-on: ubuntu-latest-4-cores
+    runs-on: ubuntu-latest
     timeout-minutes: 15
+    
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -376,14 +373,12 @@ jobs:
           path: staging_registration_report.json
           retention-days: 7
 
-  # ===========================================
-  # JOB 4: RAPPORT FINAL
-  # ===========================================
   final-report:
     name: Rapport Final
     needs: [setup-and-validation, performance-benchmark, mlflow-registration-staging]
     if: always()
     runs-on: ubuntu-latest
+    
     steps:
       - name: Téléchargement artifacts
         uses: actions/download-artifact@v4
@@ -413,10 +408,10 @@ jobs:
           ## Performance des modèles
           EOF
           
-          if [ -f "artifacts/benchmark-feature-results/benchmark_results.json" ]; then
-            python - << 'PY'
+          if [ -f "artifacts/benchmark_results.json" ]; then
+            python3 - << 'PY'
           import json
-          with open('artifacts/benchmark-feature-results/benchmark_results.json') as f:
+          with open('artifacts/benchmark_results.json') as f:
               data = json.load(f)
           print("| Modèle | Taille (MB) | FPS | Latence (ms) | Prêt |")
           print("|--------|-------------|-----|--------------|------|")
