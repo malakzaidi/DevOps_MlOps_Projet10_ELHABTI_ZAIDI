@@ -10,7 +10,7 @@ on:
       - 'scripts/**'
       - 'requirements.txt'
       - 'setup.py'
-  
+
   workflow_dispatch:
     inputs:
       test_mode:
@@ -24,26 +24,28 @@ on:
           - benchmark-only
 
 env:
-  MLFLOW_TRACKING_URI: http://localhost:5000
+  MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI || 'http://localhost:5000' }}
   PYTHON_VERSION: '3.9'
   DVC_CACHE_DIR: '/tmp/dvc-cache'
 
 jobs:
+  # ===========================================
+  # JOB 1: SETUP ET VALIDATION BRANCHE FEATURE
+  # ===========================================
   setup-and-validation:
     name: Setup et validation - Branche Feature
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-4-cores
     timeout-minutes: 15
-
+    env:
+      GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
     outputs:
       models_exist: ${{ steps.check-models.outputs.exist }}
       models_count: ${{ steps.check-models.outputs.count }}
       setup_success: ${{ steps.validate-setup.outputs.success }}
-
     steps:
-      - name: Checkout de la branche feature/add
+      - name: Checkout de la branche
         uses: actions/checkout@v4
         with:
-          ref: feature/add
           fetch-depth: 0
 
       - name: Information sur la branche
@@ -58,6 +60,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
+          cache-dependency-path: '**/requirements.txt'
 
       - name: Installation DVC avec support Google Drive
         run: |
@@ -65,21 +68,22 @@ jobs:
           dvc version
 
       - name: Configuration Google Drive Credentials
-        env:
-          GDRIVE_CREDS: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
+        if: env.GDRIVE_CREDENTIALS_JSON != ''
         run: |
-          if [ -z "$GDRIVE_CREDS" ]; then
-            echo "ERREUR CRITIQUE: Secret GDRIVE_CREDENTIALS_JSON non configuré"
-            exit 1
-          fi
-          
           mkdir -p ~/.config/dvc/tmp
-          echo "$GDRIVE_CREDS" > ~/.config/dvc/tmp/gdrive-user-credentials.json
+          echo "$GDRIVE_CREDENTIALS_JSON" > ~/.config/dvc/tmp/gdrive-user-credentials.json
           
+          # Validation JSON
           python -m json.tool ~/.config/dvc/tmp/gdrive-user-credentials.json >/dev/null || {
             echo "ERREUR: JSON credentials invalide"
             exit 1
           }
+
+      - name: Vérification présence secret GDRIVE
+        if: env.GDRIVE_CREDENTIALS_JSON == ''
+        run: |
+          echo "ERREUR CRITIQUE: Secret GDRIVE_CREDENTIALS_JSON non configuré"
+          exit 1
 
       - name: Récupération des modèles DVC
         env:
@@ -91,7 +95,7 @@ jobs:
             exit 1
           fi
           
-          dvc pull models.dvc --verbose
+          dvc pull models.dvc --verbose || exit 1
 
       - name: Vérification des modèles
         id: check-models
@@ -113,9 +117,8 @@ jobs:
             echo "Liste des modèles:"
             for model in models/*.tflite; do
               [ -f "$model" ] || continue
-              size_kb=$(du -k "$model" | cut -f1)
-              size_mb=$(echo "scale=2; $size_kb / 1024" | bc)
-              echo "  - $(basename "$model") : ${size_mb} MB"
+              size_mb=$(echo "scale=2; $(stat -c%s "$model" 2>/dev/null || stat -f%z "$model") / 1048576" | bc)
+              echo " - $(basename "$model") : ${size_mb} MB"
             done
           else
             echo "exist=false" >> $GITHUB_OUTPUT
@@ -126,6 +129,7 @@ jobs:
         id: validate-setup
         if: steps.check-models.outputs.exist == 'true'
         run: |
+          # Création setup.py si absent
           if [ ! -f "setup.py" ]; then
             cat > setup.py << 'EOF'
           from setuptools import setup, find_packages
@@ -145,13 +149,10 @@ jobs:
           fi
           
           pip install -e .
-          if [ -f "requirements.txt" ]; then
-            pip install -r requirements.txt
-          else
-            pip install opencv-python numpy tflite-runtime
-          fi
+          [ -f "requirements.txt" ] && pip install -r requirements.txt || pip install opencv-python numpy tflite-runtime
           
-          python << 'PYEOF'
+          # Test d'import et chargement modèle
+          python - << 'PY'
           import sys, os
           sys.path.insert(0, '.')
           try:
@@ -163,10 +164,9 @@ jobs:
               print("Validation réussie")
           except Exception as e:
               print(f"ERREUR: {e}")
-              import traceback
-              traceback.print_exc()
-              sys.exit(1)
-          PYEOF
+              import traceback; traceback.print_exc()
+              exit(1)
+          PY
           
           echo "success=true" >> $GITHUB_OUTPUT
 
@@ -196,30 +196,24 @@ jobs:
           
           python basic_test.py
 
+  # ===========================================
+  # JOB 2: BENCHMARK PERFORMANCE
+  # ===========================================
   performance-benchmark:
     name: Benchmark Performance
     needs: setup-and-validation
     if: needs.setup-and-validation.outputs.models_exist == 'true' && needs.setup-and-validation.outputs.setup_success == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-4-cores
     timeout-minutes: 20
-
+    env:
+      GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
     outputs:
       production_ready_count: ${{ steps.run-benchmark.outputs.production_ready_count }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          ref: feature/add
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Installation environnement
-        env:
-          GDRIVE_CREDS: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
         run: |
           pip install -e .
           pip install opencv-python numpy pandas
@@ -227,7 +221,7 @@ jobs:
           if [ -f "models.dvc" ] && [ ! "$(ls -A models/*.tflite 2>/dev/null)" ]; then
             pip install "dvc[gdrive]"
             mkdir -p ~/.config/dvc/tmp
-            echo "$GDRIVE_CREDS" > ~/.config/dvc/tmp/gdrive-user-credentials.json
+            echo "$GDRIVE_CREDENTIALS_JSON" > ~/.config/dvc/tmp/gdrive-user-credentials.json
             dvc pull models.dvc
           fi
 
@@ -242,19 +236,13 @@ jobs:
           
           results = []
           for model_file in os.listdir('models'):
-              if not model_file.endswith('.tflite'):
-                  continue
-              
+              if not model_file.endswith('.tflite'): continue
               model_path = f"models/{model_file}"
               try:
                   detector = EdgeDetector(model_path)
                   test_img = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+                  for _ in range(3): detector.predict(test_img)  # warm-up
                   
-                  # Warm-up
-                  for _ in range(3):
-                      detector.predict(test_img)
-                  
-                  # Benchmark
                   latencies = []
                   for _ in range(15):
                       start = time.perf_counter()
@@ -279,10 +267,7 @@ jobs:
               json.dump(results, f, indent=2)
           
           ready_count = sum(r["meets_requirements"] for r in results)
-          print(f"Modèles prêts pour production: {ready_count}/{len(results)}")
-          
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f"production_ready_count={ready_count}\n")
+          print(f"production_ready_count={ready_count}" >> $GITHUB_OUTPUT)
           EOF
           
           python benchmark.py
@@ -294,27 +279,22 @@ jobs:
           path: benchmark_results.json
           retention-days: 7
 
+  # ===========================================
+  # JOB 3: ENREGISTREMENT MLFLOW (STAGING)
+  # ===========================================
   mlflow-registration-staging:
     name: Enregistrement MLflow - Staging
     needs: performance-benchmark
-    if: success()
-    runs-on: ubuntu-latest
+    if: success() && github.event.inputs.test_mode != 'benchmark-only'
+    runs-on: ubuntu-latest-4-cores
     timeout-minutes: 15
-
+    env:
+      GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          ref: feature/add
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Installation et récupération modèles
-        env:
-          GDRIVE_CREDS: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
         run: |
           pip install mlflow pandas
           pip install -e .
@@ -322,15 +302,9 @@ jobs:
           if [ ! -d "models" ] || [ -z "$(ls models/*.tflite 2>/dev/null)" ]; then
             pip install "dvc[gdrive]"
             mkdir -p ~/.config/dvc/tmp
-            echo "$GDRIVE_CREDS" > ~/.config/dvc/tmp/gdrive-user-credentials.json
+            echo "$GDRIVE_CREDENTIALS_JSON" > ~/.config/dvc/tmp/gdrive-user-credentials.json
             dvc pull models.dvc
           fi
-
-      - name: Download benchmark results
-        uses: actions/download-artifact@v4
-        with:
-          name: benchmark-feature-results
-          path: .
 
       - name: Enregistrement MLflow
         env:
@@ -348,47 +322,31 @@ jobs:
           
           registered = []
           for model_file in os.listdir('models'):
-              if not model_file.endswith('.tflite'):
-                  continue
-              
+              if not model_file.endswith('.tflite'): continue
               model_path = f"models/{model_file}"
               name = model_file.replace('.tflite', '')
               
               bm = next((b for b in benchmark if b['model'] == model_file), None)
               
-              with mlflow.start_run(run_name=f"feature_add_{name}_{datetime.now().strftime('%Y%m%d_%H%M')}"):
+              with mlflow.start_run(run_name=f"feature_add_{name}_{datetime.now():%Y%m%d_%H%M}"):
                   mlflow.log_params({
-                      "model_name": name,
-                      "branch": "feature/add",
+                      "model_name": name, "branch": "feature/add",
                       "quantization": "int8" if "int8" in name.lower() else "float32",
-                      "framework": "tensorflow_lite",
-                      "environment": "staging",
-                      "git_commit": os.environ.get('GITHUB_SHA', 'unknown')
+                      "framework": "tensorflow_lite", "environment": "staging",
+                      "git_commit": "${{ github.sha }}"
                   })
-                  
                   if bm:
                       mlflow.log_metrics({
-                          "fps": bm['fps'],
-                          "latency_ms": bm['avg_latency_ms'],
+                          "fps": bm['fps'], "latency_ms": bm['avg_latency_ms'],
                           "model_size_mb": bm['size_mb']
                       })
-                  
                   mlflow.log_artifact(model_path, "models")
-                  if os.path.exists("app/inference.py"):
-                      mlflow.log_artifact("app/inference.py", "code")
-                  
+                  mlflow.log_artifact("app/inference.py", "code")
                   registered.append(model_file)
           
-          report = {
-              "total_registered": len(registered),
-              "models": registered,
-              "branch": "feature/add"
-          }
-          
+          report = {"total_registered": len(registered), "models": registered, "branch": "feature/add"}
           with open('staging_registration_report.json', 'w') as f:
               json.dump(report, f, indent=2)
-          
-          print(f"Enregistré {len(registered)} modèles dans MLflow")
           EOF
           
           python register_staging.py
@@ -400,76 +358,73 @@ jobs:
           path: staging_registration_report.json
           retention-days: 7
 
+  # ===========================================
+  # JOB 4: RAPPORT FINAL
+  # ===========================================
   final-report:
     name: Rapport Final
     needs: [setup-and-validation, performance-benchmark, mlflow-registration-staging]
     if: always()
     runs-on: ubuntu-latest
-
     steps:
       - name: Téléchargement artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: '*'
           path: artifacts
+          merge-multiple: true
 
       - name: Génération rapport final
         run: |
           cat > final_feature_report.md << 'EOF'
           # Rapport Pipeline MLOps - Branche feature/add
           
-          **Projet:** Détection d'intrusion Edge Security  
-          **Date:** $(date '+%Y-%m-%d %H:%M:%S')  
-          **Branche:** feature/add  
-          **Commit:** ${{ github.sha }}  
+          **Projet:** Détection d'intrusion Edge Security
+          **Date:** $(date)
+          **Branche:** feature/add
+          **Commit:** ${{ github.sha }}
           **Run ID:** ${{ github.run_id }}
           
           ## Statut des étapes
-          
-          | Étape | Statut | Détails |
-          |-------|--------|---------|
-          | Setup & Validation | ${{ needs.setup-and-validation.result }} | ${{ needs.setup-and-validation.outputs.models_count || '0' }} modèles |
-          | Benchmark Performance | ${{ needs.performance-benchmark.result }} | ${{ needs.performance-benchmark.outputs.production_ready_count || '0' }} prêts |
-          | MLflow Staging | ${{ needs.mlflow-registration-staging.result }} | Enregistrement staging |
+          | Étape                  | Statut   | Détails                                      |
+          |------------------------|----------|----------------------------------------------|
+          | Setup & Validation     | ${{ needs.setup-and-validation.result }} | ${{ needs.setup-and-validation.outputs.models_count || 0 }} modèles |
+          | Benchmark Performance  | ${{ needs.performance-benchmark.result }} | ${{ needs.performance-benchmark.outputs.production_ready_count || 0 }} prêts |
+          | MLflow Staging         | ${{ needs.mlflow-registration-staging.result }} | Enregistrement staging |
           
           ## Performance des modèles
-          
           EOF
           
           if [ -f "artifacts/benchmark-feature-results/benchmark_results.json" ]; then
-            python3 << 'PYEOF'
+            python - << 'PY'
           import json
-          
           with open('artifacts/benchmark-feature-results/benchmark_results.json') as f:
               data = json.load(f)
-          
           print("| Modèle | Taille (MB) | FPS | Latence (ms) | Prêt |")
           print("|--------|-------------|-----|--------------|------|")
-          
           ready = 0
           for m in data:
-              status = "✅ OUI" if m['meets_requirements'] else "❌ NON"
-              if m['meets_requirements']:
-                  ready += 1
-              print(f"| {m['model']} | {m['size_mb']:.1f} | {m['fps']:.1f} | {m['avg_latency_ms']:.1f} | {status} |")
-          
+              r = "OUI" if m['meets_requirements'] else "NON"
+              if m['meets_requirements']: ready += 1
+              print(f"| {m['model']} | {m['size_mb']:.1f} | {m['fps']:.1f} | {m['avg_latency_ms']:.1f} | {r} |")
           print(f"\n**Modèles prêts production:** {ready}/{len(data)}")
-          PYEOF
-          fi >> final_feature_report.md
+          PY
+            >> final_feature_report.md
+          else
+            echo "Aucune donnée de benchmark disponible" >> final_feature_report.md
+          fi
           
           cat >> final_feature_report.md << 'EOF'
           
           ## Recommandations
-          
           1. Vérifier que tous les tests passent
           2. S'assurer que les modèles atteignent ≥15 FPS et ≤100ms
           3. Créer une PR vers main une fois validé
           4. Mettre à jour la documentation si nécessaire
           
           ## Artifacts disponibles
-          
           - benchmark_results.json
           - staging_registration_report.json
-          
           EOF
           
           cat final_feature_report.md
