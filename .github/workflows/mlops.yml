@@ -66,10 +66,10 @@ jobs:
 
       - name: Configuration DVC avec Service Account
         env:
-          SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
         run: |
           if [ -z "$SERVICE_ACCOUNT_JSON" ]; then
-            echo "ERREUR: Secret GDRIVE_SERVICE_ACCOUNT_JSON manquant"
+            echo "ERREUR: Secret GDRIVE_CREDENTIALS_JSON manquant"
             exit 1
           fi
           
@@ -213,7 +213,7 @@ jobs:
 
       - name: Configuration DVC avec Service Account
         env:
-          SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
         run: |
           mkdir -p /tmp/dvc-gdrive
           echo "$SERVICE_ACCOUNT_JSON" > /tmp/dvc-gdrive/service_account.json
@@ -306,7 +306,7 @@ jobs:
 
       - name: Configuration DVC avec Service Account
         env:
-          SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
         run: |
           mkdir -p /tmp/dvc-gdrive
           echo "$SERVICE_ACCOUNT_JSON" > /tmp/dvc-gdrive/service_account.json
