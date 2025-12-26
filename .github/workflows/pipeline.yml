@@ -25,8 +25,7 @@ on:
 
 env:
   MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI || 'http://localhost:5000' }}
-  PYTHON_VERSION: '3.9'
-  DVC_CACHE_DIR: '/tmp/dvc-cache'
+  PYTHON_VERSION: '3.11'  # Mise à jour recommandée
 
 jobs:
   # ===========================================
@@ -36,14 +35,12 @@ jobs:
     name: Setup et validation - Branche Feature
     runs-on: ubuntu-latest-4-cores
     timeout-minutes: 15
-    env:
-      GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
     outputs:
       models_exist: ${{ steps.check-models.outputs.exist }}
       models_count: ${{ steps.check-models.outputs.count }}
       setup_success: ${{ steps.validate-setup.outputs.success }}
     steps:
-      - name: Checkout de la branche
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -64,38 +61,35 @@ jobs:
 
       - name: Installation DVC avec support Google Drive
         run: |
-          pip install "dvc[gdrive]==3.41.0" pydrive2==1.16.0
+          pip install "dvc[gdrive]==3.41.0"
           dvc version
 
-      - name: Configuration Google Drive Credentials
-        if: env.GDRIVE_CREDENTIALS_JSON != ''
-        run: |
-          mkdir -p ~/.config/dvc/tmp
-          echo "$GDRIVE_CREDENTIALS_JSON" > ~/.config/dvc/tmp/gdrive-user-credentials.json
-          
-          # Validation JSON
-          python -m json.tool ~/.config/dvc/tmp/gdrive-user-credentials.json >/dev/null || {
-            echo "ERREUR: JSON credentials invalide"
-            exit 1
-          }
-
-      - name: Vérification présence secret GDRIVE
-        if: env.GDRIVE_CREDENTIALS_JSON == ''
-        run: |
-          echo "ERREUR CRITIQUE: Secret GDRIVE_CREDENTIALS_JSON non configuré"
-          exit 1
-
-      - name: Récupération des modèles DVC
+      - name: Configuration DVC avec Service Account
         env:
-          GOOGLE_APPLICATION_CREDENTIALS: ~/.config/dvc/tmp/gdrive-user-credentials.json
+          SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
         run: |
-          if [ ! -f "models.dvc" ]; then
-            echo "Fichier models.dvc non trouvé"
-            ls -la *.dvc || echo "Aucun fichier .dvc"
+          if [ -z "$SERVICE_ACCOUNT_JSON" ]; then
+            echo "ERREUR: Secret GDRIVE_SERVICE_ACCOUNT_JSON manquant"
             exit 1
           fi
           
-          dvc pull models.dvc --verbose || exit 1
+          mkdir -p /tmp/dvc-gdrive
+          echo "$SERVICE_ACCOUNT_JSON" > /tmp/dvc-gdrive/service_account.json
+          
+          dvc remote modify --local vdrive gdrive_use_service_account true
+          dvc remote modify --local vdrive gdrive_service_account_json_file_path /tmp/dvc-gdrive/service_account.json
+          dvc remote modify --local vdrive gdrive_acknowledge_abuse true
+
+      - name: Récupération des modèles DVC
+        run: |
+          echo "Récupération des modèles via DVC..."
+          if [ ! -f "models.dvc" ]; then
+            echo "Fichier models.dvc non trouvé"
+            ls -la *.dvc || true
+            exit 1
+          fi
+          
+          dvc pull models.dvc --verbose
 
       - name: Vérification des modèles
         id: check-models
@@ -117,7 +111,7 @@ jobs:
             echo "Liste des modèles:"
             for model in models/*.tflite; do
               [ -f "$model" ] || continue
-              size_mb=$(echo "scale=2; $(stat -c%s "$model" 2>/dev/null || stat -f%z "$model") / 1048576" | bc)
+              size_mb=$(echo "scale=2; $(du -b "$model" | cut -f1) / 1048576" | bc)
               echo " - $(basename "$model") : ${size_mb} MB"
             done
           else
@@ -129,7 +123,6 @@ jobs:
         id: validate-setup
         if: steps.check-models.outputs.exist == 'true'
         run: |
-          # Création setup.py si absent
           if [ ! -f "setup.py" ]; then
             cat > setup.py << 'EOF'
           from setuptools import setup, find_packages
@@ -151,7 +144,6 @@ jobs:
           pip install -e .
           [ -f "requirements.txt" ] && pip install -r requirements.txt || pip install opencv-python numpy tflite-runtime
           
-          # Test d'import et chargement modèle
           python - << 'PY'
           import sys, os
           sys.path.insert(0, '.')
@@ -205,24 +197,37 @@ jobs:
     if: needs.setup-and-validation.outputs.models_exist == 'true' && needs.setup-and-validation.outputs.setup_success == 'true'
     runs-on: ubuntu-latest-4-cores
     timeout-minutes: 20
-    env:
-      GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
     outputs:
       production_ready_count: ${{ steps.run-benchmark.outputs.production_ready_count }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Installation environnement
+      - name: Configuration Python et DVC
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Installation dépendances
         run: |
           pip install -e .
-          pip install opencv-python numpy pandas
+          pip install opencv-python numpy pandas "dvc[gdrive]==3.41.0"
+
+      - name: Configuration DVC avec Service Account
+        env:
+          SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          mkdir -p /tmp/dvc-gdrive
+          echo "$SERVICE_ACCOUNT_JSON" > /tmp/dvc-gdrive/service_account.json
           
+          dvc remote modify --local vdrive gdrive_use_service_account true
+          dvc remote modify --local vdrive gdrive_service_account_json_file_path /tmp/dvc-gdrive/service_account.json
+          dvc remote modify --local vdrive gdrive_acknowledge_abuse true
+
+      - name: Récupération modèles si nécessaire
+        run: |
           if [ -f "models.dvc" ] && [ ! "$(ls -A models/*.tflite 2>/dev/null)" ]; then
-            pip install "dvc[gdrive]"
-            mkdir -p ~/.config/dvc/tmp
-            echo "$GDRIVE_CREDENTIALS_JSON" > ~/.config/dvc/tmp/gdrive-user-credentials.json
-            dvc pull models.dvc
+            dvc pull models.dvc --verbose
           fi
 
       - name: Exécution du benchmark
@@ -267,7 +272,7 @@ jobs:
               json.dump(results, f, indent=2)
           
           ready_count = sum(r["meets_requirements"] for r in results)
-          print(f"production_ready_count={ready_count}" >> $GITHUB_OUTPUT)
+          echo "production_ready_count=$ready_count" >> $GITHUB_OUTPUT
           EOF
           
           python benchmark.py
@@ -288,22 +293,35 @@ jobs:
     if: success() && github.event.inputs.test_mode != 'benchmark-only'
     runs-on: ubuntu-latest-4-cores
     timeout-minutes: 15
-    env:
-      GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Installation et récupération modèles
+      - name: Configuration Python et DVC
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Installation dépendances
         run: |
-          pip install mlflow pandas
+          pip install mlflow pandas "dvc[gdrive]==3.41.0"
           pip install -e .
+
+      - name: Configuration DVC avec Service Account
+        env:
+          SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          mkdir -p /tmp/dvc-gdrive
+          echo "$SERVICE_ACCOUNT_JSON" > /tmp/dvc-gdrive/service_account.json
           
+          dvc remote modify --local vdrive gdrive_use_service_account true
+          dvc remote modify --local vdrive gdrive_service_account_json_file_path /tmp/dvc-gdrive/service_account.json
+          dvc remote modify --local vdrive gdrive_acknowledge_abuse true
+
+      - name: Récupération modèles si nécessaire
+        run: |
           if [ ! -d "models" ] || [ -z "$(ls models/*.tflite 2>/dev/null)" ]; then
-            pip install "dvc[gdrive]"
-            mkdir -p ~/.config/dvc/tmp
-            echo "$GDRIVE_CREDENTIALS_JSON" > ~/.config/dvc/tmp/gdrive-user-credentials.json
-            dvc pull models.dvc
+            dvc pull models.dvc --verbose
           fi
 
       - name: Enregistrement MLflow
