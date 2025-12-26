@@ -289,7 +289,7 @@ jobs:
   mlflow-registration-staging:
     name: Enregistrement MLflow - Staging
     needs: performance-benchmark
-    if: success() && github.event.inputs.test_mode != 'benchmark-only'
+    if: ${{ success() && github.event.inputs.test_mode != 'benchmark-only' }}
     runs-on: ubuntu-latest-4-cores
     timeout-minutes: 15
 
