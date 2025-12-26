@@ -1,5 +1,5 @@
 # On ignore l'environnement virtuel et les caches
-venv/
+vision/
 __pycache__/
 .ipynb_checkpoints/
 mlruns/       <-- On ne pousse pas MLflow (trop de petits fichiers)
@@ -36,3 +36,5 @@ notebooks/mlruns/
 
 .vscode/
 .idea/
+
+
