@@ -70,22 +70,22 @@ jobs:
           dvc version
 
       - name: Configuration Google Drive Credentials
-        if: ${{ secrets.GDRIVE_CREDENTIALS_JSON != '' }}
+        env:
+          GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
         run: |
+          if [ -z "$GDRIVE_CREDENTIALS" ]; then
+            echo "ERREUR CRITIQUE: Secret GDRIVE_CREDENTIALS_JSON non configuré"
+            exit 1
+          fi
+          
           mkdir -p ~/.config/dvc/tmp
-          echo "${{ secrets.GDRIVE_CREDENTIALS_JSON }}" > ~/.config/dvc/tmp/gdrive-user-credentials.json
+          echo "$GDRIVE_CREDENTIALS" > ~/.config/dvc/tmp/gdrive-user-credentials.json
           
           # Validation JSON
           python -m json.tool ~/.config/dvc/tmp/gdrive-user-credentials.json >/dev/null || {
             echo "ERREUR: JSON credentials invalide"
             exit 1
           }
-
-      - name: Vérification présence secret GDRIVE
-        if: ${{ secrets.GDRIVE_CREDENTIALS_JSON == '' }}
-        run: |
-          echo "ERREUR CRITIQUE: Secret GDRIVE_CREDENTIALS_JSON non configuré"
-          exit 1
 
       - name: Récupération des modèles DVC
         env:
@@ -218,6 +218,8 @@ jobs:
           ref: feature/add
 
       - name: Installation environnement
+        env:
+          GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
         run: |
           pip install -e .
           pip install opencv-python numpy pandas
@@ -225,7 +227,7 @@ jobs:
           if [ -f "models.dvc" ] && [ ! "$(ls -A models/*.tflite 2>/dev/null)" ]; then
             pip install "dvc[gdrive]"
             mkdir -p ~/.config/dvc/tmp
-            echo "${{ secrets.GDRIVE_CREDENTIALS_JSON }}" > ~/.config/dvc/tmp/gdrive-user-credentials.json
+            echo "$GDRIVE_CREDENTIALS" > ~/.config/dvc/tmp/gdrive-user-credentials.json
             dvc pull models.dvc
           fi
 
@@ -271,7 +273,8 @@ jobs:
               json.dump(results, f, indent=2)
           
           ready_count = sum(r["meets_requirements"] for r in results)
-          print(f"::set-output name=production_ready_count::{ready_count}")
+          print(f"production_ready_count={ready_count}")
+          print(f"production_ready_count={ready_count}" >> "$GITHUB_OUTPUT")
           EOF
           
           python benchmark.py
@@ -289,7 +292,7 @@ jobs:
   mlflow-registration-staging:
     name: Enregistrement MLflow - Staging
     needs: performance-benchmark
-    if: ${{ success() && github.event.inputs.test_mode != 'benchmark-only' }}
+    if: success() && github.event.inputs.test_mode != 'benchmark-only'
     runs-on: ubuntu-latest-4-cores
     timeout-minutes: 15
 
@@ -300,6 +303,8 @@ jobs:
           ref: feature/add
 
       - name: Installation et récupération modèles
+        env:
+          GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
         run: |
           pip install mlflow pandas
           pip install -e .
@@ -307,7 +312,7 @@ jobs:
           if [ ! -d "models" ] || [ -z "$(ls models/*.tflite 2>/dev/null)" ]; then
             pip install "dvc[gdrive]"
             mkdir -p ~/.config/dvc/tmp
-            echo "${{ secrets.GDRIVE_CREDENTIALS_JSON }}" > ~/.config/dvc/tmp/gdrive-user-credentials.json
+            echo "$GDRIVE_CREDENTIALS" > ~/.config/dvc/tmp/gdrive-user-credentials.json
             dvc pull models.dvc
           fi
 
