@@ -15,7 +15,7 @@ data/         <-- On ignore la vidéo et les images (trop lourd / copyright)
 /models
 
 /.dvc/config
-/.dvc/vdrive-creds.json
+/.dvc/drive.json
 vdrive-creds.json
 venv
 
@@ -23,7 +23,7 @@ venv
 .dvc/tmp/
 .dvc/config.local
 .dvc/*-creds.json
-.dvc/vdrive-creds.json
+.dvc/drive.json
 *-creds.json
 *.credentials
 
@@ -34,8 +34,14 @@ venv
 # Notebooks
 notebooks/mlruns/
 
+
 .vscode/
 .idea/
 
 
 vision
+
+
+.dvc/config.local.bak
+
+service_account.json
