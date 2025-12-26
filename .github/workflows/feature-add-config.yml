@@ -1,0 +1,37 @@
+# Configuration spécifique à la branche feature/add
+feature_branch_config:
+  branch_name: "feature/add"
+  
+  # Critères de performance
+  performance_thresholds:
+    min_fps: 15
+    max_latency_ms: 100
+    min_models_tested: 1
+    min_ready_percentage: 50
+  
+  # Configuration MLflow
+  mlflow:
+    experiment_staging: "Edge_Security_Feature_Staging"
+    experiment_production: "Edge_Security_Models"
+    tags:
+      branch_type: "feature"
+      feature_name: "add"
+      application: "security_surveillance"
+  
+  # Tests
+  tests:
+    benchmark_iterations: 15
+    basic_test_iterations: 2
+    warmup_iterations: 3
+  
+  # Notifications
+  notifications:
+    slack_channel: "#mlops-features"
+    email_recipients: "ml-team@company.com"
+  
+  # Artifacts retention
+  retention_days:
+    benchmark_results: 7
+    mlflow_reports: 7
+    final_reports: 30
+    badges: 30
