@@ -7,53 +7,107 @@ jobs:
   test-dvc:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      
-      - name: Setup Python
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
-      - name: Install DVC
-        run: pip install "dvc[gdrive]==3.41.0"
-      
-      - name: Configure Google Drive
+
+      - name: Install DVC and dependencies
+        run: |
+          pip install "dvc[gdrive]==3.41.0"
+          pip install tflite-runtime opencv-python numpy
+
+      - name: Configure Google Drive Service Account
         env:
           GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
         run: |
-          echo "🔐 Configuration des credentials..."
+          if [ -z "$GDRIVE_CREDENTIALS_JSON" ]; then
+            echo "Error: GDRIVE_CREDENTIALS_JSON secret is missing or empty"
+            exit 1
+          fi
+          
           mkdir -p ~/.dvc
           echo "$GDRIVE_CREDENTIALS_JSON" > ~/.dvc/gdrive_service_account.json
           
-          # Validation
-          python3 << 'PY'
-          import json, sys
+          python3 - << 'PYTHON'
+          import json
+          import sys
           
           with open('/home/runner/.dvc/gdrive_service_account.json') as f:
               creds = json.load(f)
           
           if creds.get('type') != 'service_account':
-              print(f"❌ Type incorrect: {creds.get('type')}")
+              print(f"Error: Invalid credential type: {creds.get('type', 'missing')}. Expected 'service_account'")
               sys.exit(1)
           
-          print("✅ Credentials valides")
-          print(f"   Type: {creds['type']}")
-          print(f"   Project: {creds['project_id']}")
-          print(f"   Email: {creds['client_email']}")
-          PY
+          print("Valid Service Account credentials")
+          print(f"Project ID: {creds.get('project_id')}")
+          print(f"Client Email: {creds.get('client_email')}")
+          PYTHON
           
-          # Configuration DVC
-          REMOTE_NAME=$(dvc remote list | head -n1 | awk '{print $1}')
-          echo "Remote: $REMOTE_NAME"
+          REMOTE_NAME=$(dvc remote list | head -n1 | awk '{print $1}' || echo "vdrive")
+          echo "Detected remote name: $REMOTE_NAME"
           
           dvc remote modify --local "$REMOTE_NAME" gdrive_use_service_account true
-          dvc remote modify --local "$REMOTE_NAME" gdrive_service_account_json_file_path "$HOME/.dvc/gdrive_service_account.json"
+          dvc remote modify --local "$REMOTE_NAME" gdrive_service_account_json_file_path ~/.dvc/gdrive_service_account.json
           dvc remote modify --local "$REMOTE_NAME" gdrive_acknowledge_abuse true
-      
-      - name: Test DVC Pull
+
+      - name: Pull models with DVC
         run: |
-          echo "📥 Test de récupération des modèles..."
+          echo "Pulling models from DVC remote..."
           dvc pull models.dvc --verbose
+          echo "DVC pull completed"
+
+      - name: Verify downloaded models
+        run: |
+          if [ ! -d "models" ]; then
+            echo "Error: models directory not found after pull"
+            exit 1
+          fi
           
-          echo "✅ Pull réussi !"
+          echo "Models directory content:"
           ls -lh models/
+          
+          count=$(find models -name "*.tflite" -type f | wc -l)
+          echo "Number of .tflite models found: $count"
+          
+          if [ "$count" -eq 0 ]; then
+            echo "Error: No .tflite models found"
+            exit 1
+          fi
+
+      - name: Test model loading and inference
+        run: |
+          python3 - << 'PYTHON'
+          import os
+          import numpy as np
+          from app.inference import EdgeDetector
+          
+          model_files = [f for f in os.listdir('models') if f.endswith('.tflite')]
+          if not model_files:
+              raise FileNotFoundError("No .tflite model found in models/ directory")
+          
+          print(f"Found {len(model_files)} model(s). Testing the first one: {model_files[0]}")
+          
+          model_path = os.path.join('models', model_files[0])
+          detector = EdgeDetector(model_path)
+          
+          print(f"Model loaded successfully")
+          print(f"Input shape: {detector.input_width}x{detector.input_height}x3")
+          
+          # Simple inference test
+          test_image = np.random.randint(0, 255, (detector.input_height, detector.input_width, 3), dtype=np.uint8)
+          boxes, classes, scores, latency = detector.predict(test_image)
+          
+          print(f"Inference completed in {latency:.2f} ms")
+          print(f"Detected {len(scores)} objects")
+          print("All tests passed successfully")
+          PYTHON
+
+      - name: Final status
+        run: |
+          echo "Test workflow completed successfully"
+          echo "DVC pull, model loading, and inference all work correctly"
