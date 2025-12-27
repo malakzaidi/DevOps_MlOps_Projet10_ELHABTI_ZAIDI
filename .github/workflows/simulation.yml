@@ -16,7 +16,6 @@ jobs:
   setup-and-data:
     name: 1. Data & Environment Setup
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -50,22 +49,19 @@ jobs:
     name: 2. x86 Cloud - FP32
     needs: setup-and-data
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/download-artifact@v4
         with:
           name: edge-models
           path: models/
-
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-
       - name: Install Dependencies
-        run: pip install tflite-runtime psutil numpy
-
+        run: |
+          pip install "numpy<2" psutil
+          pip install tflite-runtime
       - name: Run Benchmark
         run: |
           mkdir -p results
@@ -73,7 +69,6 @@ jobs:
             --output results/x86_fp32.json \
             --device "x86 Cloud" \
             --precision fp32
-
       - uses: actions/upload-artifact@v4
         with:
           name: x86-fp32-results
@@ -83,22 +78,19 @@ jobs:
     name: 3. x86 Cloud - INT8
     needs: setup-and-data
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/download-artifact@v4
         with:
           name: edge-models
           path: models/
-
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-
       - name: Install Dependencies
-        run: pip install tflite-runtime psutil numpy
-
+        run: |
+          pip install "numpy<2" psutil
+          pip install tflite-runtime
       - name: Run Benchmark
         run: |
           mkdir -p results
@@ -106,7 +98,6 @@ jobs:
             --output results/x86_int8.json \
             --device "x86 Cloud" \
             --precision int8
-
       - uses: actions/upload-artifact@v4
         with:
           name: x86-int8-results
@@ -116,25 +107,20 @@ jobs:
     name: 4. ARM64 Edge - INT8 (Native)
     needs: setup-and-data
     runs-on: ubuntu-24.04-arm
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/download-artifact@v4
         with:
           name: edge-models
           path: models/
-
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-
       - name: Install Dependencies
         run: |
-          pip install psutil numpy
+          pip install "numpy<2" psutil
           pip install --no-cache-dir \
             https://github.com/PINTO0309/TensorflowLite-bin/releases/download/v2.15.0.post1/tflite_runtime-2.15.0.post1-cp311-cp311-linux_aarch64.whl
-
       - name: Run Benchmark
         run: |
           mkdir -p results
@@ -142,7 +128,6 @@ jobs:
             --output results/arm64_int8.json \
             --device "ARM64 Edge" \
             --precision int8
-
       - uses: actions/upload-artifact@v4
         with:
           name: arm64-int8-results
@@ -155,26 +140,20 @@ jobs:
       - benchmark-x86-int8
       - benchmark-arm64-int8
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-
       - name: Install Dependencies
         run: pip install matplotlib pandas
-
       - name: Download All Results
         uses: actions/download-artifact@v4
         with:
           path: all-results/
-
       - name: Generate Report & Chart
         run: |
           mkdir -p scripts
-
           cat <<'EOF' > scripts/generate_report.py
           import json
           import pandas as pd
@@ -213,12 +192,9 @@ jobs:
 
           Path("final_report.md").write_text(report)
           EOF
-
           python scripts/generate_report.py
-
       - name: Publish to Job Summary
         run: cat final_report.md >> $GITHUB_STEP_SUMMARY
-
       - name: Upload Dashboard
         uses: actions/upload-artifact@v4
         with:
