@@ -16,10 +16,9 @@ def run_benchmark(device: str = "CPU", precision: str = "fp32"):
 
     model_path = model_map.get(precision)
     if not Path(model_path).exists():
-        raise FileNotFoundError(f"Model not found: {model_path}. Check that DVC pulled the models correctly.")
+        raise FileNotFoundError(f"Model not found: {model_path}. Check DVC pull.")
 
     print(f"Loading real {precision.upper()} model: {model_path} on {device}")
-
     arch = platform.machine()
     print(f"Detected architecture: {arch}")
 
@@ -29,8 +28,8 @@ def run_benchmark(device: str = "CPU", precision: str = "fp32"):
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
 
-    # CHANGE THIS TO MATCH YOUR MODEL'S INPUT SHAPE
-    # Example for common vision models (1, 224, 224, 3)
+    # Default dummy input – CHANGE THIS SHAPE if your model expects different size!
+    # Example: most image models use (1, 224, 224, 3)
     input_shape = input_details[0]['shape']
     dummy_input = np.random.random(input_shape).astype(np.float32)
 
