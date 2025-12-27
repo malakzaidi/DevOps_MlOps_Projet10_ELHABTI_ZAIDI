@@ -156,12 +156,13 @@ jobs:
           # Install DVC if needed
           pip install "dvc[gdrive]==3.41.0"
           
-          # Finally install the package in editable mode
-          # This ensures tflite-runtime is not overwritten
-          pip install -e . --no-deps
+          # Install requirements.txt if it exists (without installing package in editable mode)
+          if [ -f "requirements.txt" ]; then
+            pip install -r requirements.txt
+          fi
           
           # Verify tflite-runtime is installed
-          python -c "import tflite_runtime.interpreter as tflite; print('tflite-runtime OK')"
+          python -c "import tflite_runtime.interpreter as tflite; print('✓ tflite-runtime OK')"
 
       - name: Configure DVC Service Account
         env:
@@ -178,6 +179,10 @@ jobs:
 
       - name: Pull models if needed
         run: |
+          # Add current directory to PYTHONPATH for importing app module
+          export PYTHONPATH="${PYTHONPATH}:$(pwd)"
+          echo "PYTHONPATH=$(pwd)" >> $GITHUB_ENV
+          
           if [ ! "$(ls -A models/*.tflite 2>/dev/null)" ]; then
             dvc pull models.dvc
           fi
@@ -331,10 +336,14 @@ jobs:
           pip install tflite-runtime
           pip install mlflow pandas opencv-python numpy
           pip install "dvc[gdrive]==3.41.0"
-          pip install -e . --no-deps
+          
+          # Install requirements.txt if it exists
+          if [ -f "requirements.txt" ]; then
+            pip install -r requirements.txt
+          fi
           
           # Verify installation
-          python -c "import tflite_runtime.interpreter as tflite; print('tflite-runtime OK')"
+          python -c "import tflite_runtime.interpreter as tflite; print('✓ tflite-runtime OK')"
 
       - name: Configure DVC Service Account
         env:
@@ -351,6 +360,10 @@ jobs:
 
       - name: Pull models if needed
         run: |
+          # Add current directory to PYTHONPATH for importing app module
+          export PYTHONPATH="${PYTHONPATH}:$(pwd)"
+          echo "PYTHONPATH=$(pwd)" >> $GITHUB_ENV
+          
           if [ ! -d "models" ] || [ -z "$(ls models/*.tflite 2>/dev/null)" ]; then
             dvc pull models.dvc
           fi
