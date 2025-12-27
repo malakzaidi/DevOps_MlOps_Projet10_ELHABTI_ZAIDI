@@ -28,10 +28,22 @@ def run_benchmark(device: str = "CPU", precision: str = "fp32"):
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
 
-    # Default dummy input – CHANGE THIS SHAPE if your model expects different size!
-    # Example: most image models use (1, 224, 224, 3)
+    # Get input shape and dtype from the model
     input_shape = input_details[0]['shape']
-    dummy_input = np.random.random(input_shape).astype(np.float32)
+    input_dtype = input_details[0]['dtype']
+    
+    print(f"Model expects input shape: {input_shape}, dtype: {input_dtype}")
+
+    # Create dummy input with the correct dtype
+    if input_dtype == np.uint8:
+        # For INT8 quantized models - generate random UINT8 data
+        dummy_input = np.random.randint(0, 256, size=input_shape, dtype=np.uint8)
+    elif input_dtype == np.int8:
+        # For some INT8 models that use signed integers
+        dummy_input = np.random.randint(-128, 128, size=input_shape, dtype=np.int8)
+    else:
+        # For FP32 and other float models
+        dummy_input = np.random.random(input_shape).astype(input_dtype)
 
     # Warmup
     for _ in range(10):
@@ -62,6 +74,7 @@ def run_benchmark(device: str = "CPU", precision: str = "fp32"):
         "device": device,
         "precision": precision,
         "architecture": arch,
+        "input_dtype": str(input_dtype),
         "avg_latency_ms": round(avg_latency_ms, 2),
         "fps": round(fps, 2),
         "model_size_mb": round(model_size_mb, 1),
