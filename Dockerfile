@@ -1,32 +1,44 @@
+# Base image with Python 3.9 (slim for smaller size)
 FROM python:3.9-slim
 
+# Set working directory
 WORKDIR /app
 
-# Installation des dépendances système
+# Install required system dependencies (for OpenCV, etc.)
 RUN apt-get update && apt-get install -y \
     libgl1 \
     libglib2.0-0 \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copie et installation des dépendances Python
+# Copy only requirements first (better layer caching)
 COPY requirements.txt .
+
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Création préventive de TOUTE la structure
-RUN mkdir -p models data app scripts results
+# Copy the entire project context into the image
+# This includes benchmark.py, app/, scripts/, etc.
+COPY . .
 
-# Copie du code source de manière sécurisée
-# On utilise COPY . . pour tout prendre, puis on nettoie ou on cible
-# Mais pour être ultra-propre, on copie les éléments racines un par un
-COPY *.py ./
+# === CRITICAL SAFETY CHECKS ===
+# Fail the build early if benchmark.py is missing (e.g. due to .dockerignore)
+RUN if [ ! -f "/app/benchmark.py" ]; then \
+        echo "ERROR: benchmark.py is MISSING in the Docker image!" && \
+        echo "Current files in /app:" && \
+        ls -la /app/ && \
+        exit 1; \
+    fi
 
-# Pour les dossiers, on utilise une astuce : on copie le contenu s'il existe
-# sans faire échouer le build si le dossier est absent localement.
-# Note: Dans GitHub Actions, on va s'assurer que ces dossiers existent.
-COPY app/ ./app/
-# On ne COPY pas scripts/ ici si on n'est pas sûr qu'il existe.
-# On le fera via le pipeline CI/CD ou on l'inclut seulement s'il est là.
+RUN echo "benchmark.py successfully copied into image:" && \
+    ls -la /app/benchmark.py
 
-# Commande par défaut
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Create necessary directories (in case they are empty or git-ignored)
+RUN mkdir -p models data results
+
+# Optional: Make benchmark.py executable (useful if running directly)
+# RUN chmod +x benchmark.py
+
+# Default command: run the benchmark script
+# (You can override this in docker run if needed)
+CMD ["python", "benchmark.py", "--help"]
