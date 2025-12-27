@@ -10,6 +10,7 @@ on:
       - 'scripts/**'
       - 'requirements.txt'
       - 'setup.py'
+      - '.github/workflows/**'  # Permet de tester les changements du workflow
 
   workflow_dispatch:
     inputs:
