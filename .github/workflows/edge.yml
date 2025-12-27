@@ -1,0 +1,151 @@
+name: MLOps Edge AI - Expert Pipeline
+
+on:
+  push:
+    branches: [ main, feature/** ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+  PYTHON_VERSION: '3.11'
+  DVC_REMOTE_NAME: 'vdrive'
+
+jobs:
+  # --- PHASE 1: VALIDATION & DATA (x86) ---
+  setup-and-data:
+    name: 🛠️ Setup & DVC Pull
+    runs-on: ubuntu-latest
+    outputs:
+      model_version: ${{ steps.get-version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install DVC
+        run: pip install "dvc[gdrive]==3.41.0"
+
+      - name: Configure DVC & Pull
+        env:
+          GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
+        run: |
+          mkdir -p ~/.dvc
+          echo "$GDRIVE_CREDENTIALS" > ~/.dvc/gdrive_service_account.json
+          dvc remote modify --local ${{ env.DVC_REMOTE_NAME }} gdrive_use_service_account true
+          dvc remote modify --local ${{ env.DVC_REMOTE_NAME }} gdrive_service_account_json_file_path ~/.dvc/gdrive_service_account.json
+          dvc pull models.dvc
+
+      - name: Get Model Version
+        id: get-version
+        run: echo "version=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Upload Models Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: edge-models
+          path: models/
+
+  # --- PHASE 2: BENCHMARK x86 (Simulation Docker) ---
+  benchmark-x86:
+    name: 💻 Benchmark x86 (Cloud)
+    needs: setup-and-data
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Models
+        uses: actions/download-artifact@v4
+        with:
+          name: edge-models
+          path: models/
+
+      - name: Run Benchmark
+        run: |
+          mkdir -p data results
+          # Simulation Docker avec limites
+          docker build -t edge-sim-x86 .
+          docker run --rm --cpus="0.5" --memory="512m" \
+            -v $(pwd)/models:/app/models \
+            edge-sim-x86 python benchmark.py --output results/x86_metrics.json
+
+      - name: Upload x86 Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: x86-results
+          path: results/x86_metrics.json
+
+  # --- PHASE 3: REAL EDGE TEST (ARM64 / Raspberry Pi) ---
+  benchmark-arm64:
+    name: 🍓 Real Edge Test (Raspberry Pi)
+    needs: setup-and-data
+    # Ce job nécessite un runner auto-hébergé sur un Raspberry Pi
+    runs-on: [self-hosted, linux, arm64, raspberry-pi]
+    continue-on-error: true # Ne bloque pas le pipeline si le Pi est hors-ligne
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Models
+        uses: actions/download-artifact@v4
+        with:
+          name: edge-models
+          path: models/
+
+      - name: Run Native Inference
+        run: |
+          mkdir -p results
+          # Installation native pour tester les performances réelles du CPU ARM
+          python3 -m pip install tflite-runtime numpy opencv-python
+          python3 benchmark.py --output results/arm64_metrics.json --device "Raspberry Pi"
+
+      - name: Upload ARM64 Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-results
+          path: results/arm64_metrics.json
+
+  # --- PHASE 4: MLFLOW & REPORTING ---
+  reporting-and-registration:
+    name: 📊 Report & MLflow Staging
+    needs: [benchmark-x86, benchmark-arm64]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download All Results
+        uses: actions/download-artifact@v4
+        with:
+          path: all-results/
+
+      - name: Generate Consolidated Report
+        run: |
+          pip install pandas tabulate mlflow
+          python scripts/generate_report.py \
+            --x86 all-results/x86-results/x86_metrics.json \
+            --arm64 all-results/arm64-results/arm64_metrics.json \
+            --output final_report.md
+
+      - name: Register to MLflow
+        if: github.ref == 'refs/heads/main'
+        env:
+          MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
+        run: |
+          python scripts/register_model.py \
+            --metrics all-results/ \
+            --stage "Staging"
+
+      - name: Publish Report to PR
+        if: github.event_name == 'pull_request'
+        uses: thollander/actions-comment-pull-request@v2
+        with:
+          filePath: final_report.md
