@@ -2,60 +2,90 @@ import argparse
 import time
 import json
 import os
+import psutil
+import platform
 from pathlib import Path
+import numpy as np
+from tflite_runtime.interpreter import Interpreter
 
-# For this simulation, we'll just fake some realistic metrics
-# In a real project, this would load your model and run inference
+def run_benchmark(device: str = "CPU", precision: str = "fp32"):
+    model_map = {
+        "fp32": "models/model_float32.tflite",
+        "int8": "models/model_int8.tflite"
+    }
 
-def run_benchmark(device: str = "CPU"):
-    print(f"Running simulated benchmark on {device}...")
-    
-    # Simulate warmup
-    time.sleep(1)
-    
-    # Simulate inference time for 100 frames
+    model_path = model_map.get(precision)
+    if not Path(model_path).exists():
+        raise FileNotFoundError(f"Model not found: {model_path}. Check that DVC pulled the models correctly.")
+
+    print(f"Loading real {precision.upper()} model: {model_path} on {device}")
+
+    arch = platform.machine()
+    print(f"Detected architecture: {arch}")
+
+    interpreter = Interpreter(model_path=model_path)
+    interpreter.allocate_tensors()
+
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+
+    # CHANGE THIS TO MATCH YOUR MODEL'S INPUT SHAPE
+    # Example for common vision models (1, 224, 224, 3)
+    input_shape = input_details[0]['shape']
+    dummy_input = np.random.random(input_shape).astype(np.float32)
+
+    # Warmup
+    for _ in range(10):
+        interpreter.set_tensor(input_details[0]['index'], dummy_input)
+        interpreter.invoke()
+
     num_frames = 100
     total_time = 0.0
-    
-    for i in range(num_frames):
+    process = psutil.Process(os.getpid())
+    peak_memory_mb = process.memory_info().rss / 1024 / 1024
+
+    for _ in range(num_frames):
         start = time.time()
-        # Fake inference (replace with real model inference later)
-        time.sleep(0.008)  # ~125 FPS base
+        interpreter.set_tensor(input_details[0]['index'], dummy_input)
+        interpreter.invoke()
         end = time.time()
         total_time += (end - start)
-    
+
+        mem = process.memory_info().rss / 1024 / 1024
+        if mem > peak_memory_mb:
+            peak_memory_mb = mem
+
     avg_latency_ms = (total_time / num_frames) * 1000
     fps = num_frames / total_time
-    
-    # Adjust slightly based on "device"
-    if "raspberry" in device.lower() or "arm" in device.lower():
-        avg_latency_ms *= 3.5   # Simulate slower edge device
-        fps /= 3.5
-    
+    model_size_mb = os.path.getsize(model_path) / (1024 * 1024)
+
     metrics = {
         "device": device,
+        "precision": precision,
+        "architecture": arch,
         "avg_latency_ms": round(avg_latency_ms, 2),
         "fps": round(fps, 2),
+        "model_size_mb": round(model_size_mb, 1),
+        "peak_memory_mb": round(peak_memory_mb, 1),
         "total_frames": num_frames,
-        "notes": "Simulated benchmark (real inference coming soon)"
+        "notes": "Real TFLite inference"
     }
-    
-    print(f"Benchmark complete: {fps:.1f} FPS, {avg_latency_ms:.1f} ms latency")
+
+    print(f"Benchmark complete: {fps:.1f} FPS, {avg_latency_ms:.2f} ms latency")
     return metrics
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Edge AI Benchmark")
-    parser.add_argument("--output", type=str, required=True, help="Path to save JSON results")
-    parser.add_argument("--device", type=str, default="CPU", help="Device name (e.g., x86, Raspberry Pi)")
-    
+    parser.add_argument("--output", type=str, required=True)
+    parser.add_argument("--device", type=str, default="CPU")
+    parser.add_argument("--precision", type=str, default="fp32", choices=["fp32", "int8"])
+
     args = parser.parse_args()
-    
-    results = run_benchmark(device=args.device)
-    
-    # Ensure output directory exists
+
+    results = run_benchmark(device=args.device, precision=args.precision)
+
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    
     with open(args.output, "w") as f:
         json.dump(results, f, indent=2)
-    
+
     print(f"Results saved to {args.output}")
