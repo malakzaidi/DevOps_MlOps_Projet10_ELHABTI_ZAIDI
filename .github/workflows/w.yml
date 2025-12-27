@@ -3,14 +3,6 @@ name: MLOps Edge Security Pipeline - Feature Branch
 on:
   push:
     branches: [ feature/add ]
-    paths:
-      - 'app/**'
-      - 'models.dvc'
-      - 'data.dvc'
-      - 'scripts/**'
-      - 'requirements.txt'
-      - 'setup.py'
-      - '.github/workflows/**'  # Permet de tester les changements du workflow
 
   workflow_dispatch:
     inputs:
