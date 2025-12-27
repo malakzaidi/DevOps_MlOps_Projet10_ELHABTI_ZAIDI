@@ -28,6 +28,7 @@ on:
 env:
   MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI || 'http://localhost:5000' }}
   PYTHON_VERSION: '3.11'
+  DVC_VERSION: '3.41.0'
 
 jobs:
   setup-and-validation:
@@ -47,6 +48,7 @@ jobs:
 
       - name: Information sur la branche
         run: |
+          echo "🔍 Informations sur la branche"
           echo "Branche actuelle: ${{ github.ref }}"
           echo "Nom de branche: ${{ github.ref_name }}"
           echo "SHA du commit: ${{ github.sha }}"
@@ -61,60 +63,124 @@ jobs:
 
       - name: Installation DVC avec support Google Drive
         run: |
-          pip install "dvc[gdrive]==3.41.0"
+          echo "📦 Installation de DVC ${{ env.DVC_VERSION }}"
+          pip install "dvc[gdrive]==${{ env.DVC_VERSION }}"
           dvc version
 
-      - name: Configuration DVC avec Service Account
-        env:
-          SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
+      - name: Vérification configuration DVC
         run: |
-          if [ -z "$SERVICE_ACCOUNT_JSON" ]; then
-            echo "ERREUR: Secret GDRIVE_CREDENTIALS_JSON manquant"
+          echo "📋 Configuration DVC actuelle:"
+          cat .dvc/config || echo "Pas de fichier .dvc/config"
+          echo ""
+          echo "📂 Fichiers .dvc disponibles:"
+          ls -lh *.dvc 2>/dev/null || echo "Aucun fichier .dvc"
+
+      - name: Configuration Google Drive avec Service Account
+        env:
+          GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
+        run: |
+          echo "🔐 Configuration de l'authentification Google Drive..."
+          
+          # Vérifier que le secret existe
+          if [ -z "$GDRIVE_CREDENTIALS_JSON" ]; then
+            echo "❌ ERREUR: Secret GDRIVE_CREDENTIALS_JSON manquant"
+            echo "Vérifiez Settings → Secrets and variables → Actions"
             exit 1
           fi
           
-          mkdir -p /tmp/dvc-gdrive
-          echo "$SERVICE_ACCOUNT_JSON" > /tmp/dvc-gdrive/service_account.json
+          # Créer le répertoire pour les credentials
+          mkdir -p ~/.dvc
           
-          dvc remote modify --local vdrive gdrive_use_service_account true
-          dvc remote modify --local vdrive gdrive_service_account_json_file_path /tmp/dvc-gdrive/service_account.json
-          dvc remote modify --local vdrive gdrive_acknowledge_abuse true
+          # Écrire le fichier de service account
+          echo "$GDRIVE_CREDENTIALS_JSON" > ~/.dvc/gdrive_service_account.json
+          
+          # Vérifier que le JSON est valide
+          if ! python3 -c "import json; json.load(open('$HOME/.dvc/gdrive_service_account.json'))" 2>/dev/null; then
+            echo "❌ Le fichier JSON des credentials est invalide"
+            exit 1
+          fi
+          
+          echo "✅ Fichier credentials créé avec succès"
+          
+          # Détecter automatiquement le nom du remote
+          REMOTE_NAME=$(dvc remote list 2>/dev/null | head -n1 | awk '{print $1}')
+          
+          if [ -z "$REMOTE_NAME" ]; then
+            echo "⚠️ Aucun remote DVC détecté, utilisation du nom par défaut 'gdrive'"
+            REMOTE_NAME="gdrive"
+          fi
+          
+          echo "🔧 Configuration du remote DVC: $REMOTE_NAME"
+          
+          # Configurer DVC pour utiliser le service account
+          dvc remote modify --local "$REMOTE_NAME" gdrive_use_service_account true
+          dvc remote modify --local "$REMOTE_NAME" gdrive_service_account_json_file_path "$HOME/.dvc/gdrive_service_account.json"
+          dvc remote modify --local "$REMOTE_NAME" gdrive_acknowledge_abuse true
+          
+          echo "✅ Configuration DVC terminée"
+          echo ""
+          echo "📄 Configuration locale créée:"
+          cat .dvc/config.local 2>/dev/null || echo "Fichier config.local créé"
 
       - name: Récupération des modèles DVC
         run: |
-          echo "Récupération des modèles via DVC..."
+          echo "📥 Récupération des modèles via DVC..."
+          
           if [ ! -f "models.dvc" ]; then
-            echo "Fichier models.dvc non trouvé"
-            ls -la *.dvc || true
+            echo "❌ ERREUR: Fichier models.dvc non trouvé"
+            echo "Fichiers .dvc disponibles:"
+            ls -la *.dvc || echo "Aucun"
             exit 1
           fi
           
+          echo "✅ Fichier models.dvc trouvé"
+          echo "Contenu du fichier:"
+          cat models.dvc
+          echo ""
+          
+          # Pull avec verbose pour debug
+          echo "⏳ Lancement du pull DVC..."
           dvc pull models.dvc --verbose
+          
+          echo "✅ Pull DVC terminé"
 
       - name: Vérification des modèles
         id: check-models
         run: |
+          echo "🔍 Vérification des modèles téléchargés..."
+          
           if [ ! -d "models" ]; then
-            echo "ERREUR: Dossier 'models/' non trouvé"
+            echo "❌ ERREUR: Dossier 'models/' non trouvé après pull"
+            echo "Contenu du répertoire actuel:"
+            ls -la
             echo "exist=false" >> $GITHUB_OUTPUT
             echo "count=0" >> $GITHUB_OUTPUT
-            exit 0
+            exit 1
           fi
           
+          echo "✅ Dossier models/ trouvé"
+          echo "Contenu:"
+          ls -lh models/
+          echo ""
+          
           count=$(find models -name "*.tflite" -type f | wc -l)
-          echo "Modèles .tflite trouvés: $count"
+          echo "📊 Modèles .tflite trouvés: $count"
           
           if [ $count -gt 0 ]; then
             echo "exist=true" >> $GITHUB_OUTPUT
             echo "count=$count" >> $GITHUB_OUTPUT
             
-            echo "Liste des modèles:"
+            echo ""
+            echo "📋 Liste détaillée des modèles:"
             for model in models/*.tflite; do
-              [ -f "$model" ] || continue
-              size_mb=$(echo "scale=2; $(du -b "$model" | cut -f1) / 1048576" | bc)
-              echo " - $(basename "$model") : ${size_mb} MB"
+              if [ -f "$model" ]; then
+                size_bytes=$(stat -f%z "$model" 2>/dev/null || stat -c%s "$model" 2>/dev/null)
+                size_mb=$(echo "scale=2; $size_bytes / 1048576" | bc)
+                echo " ✓ $(basename "$model") : ${size_mb} MB"
+              fi
             done
           else
+            echo "⚠️ Aucun modèle .tflite trouvé"
             echo "exist=false" >> $GITHUB_OUTPUT
             echo "count=0" >> $GITHUB_OUTPUT
           fi
@@ -123,7 +189,11 @@ jobs:
         id: validate-setup
         if: steps.check-models.outputs.exist == 'true'
         run: |
+          echo "📦 Installation des dépendances..."
+          
+          # Créer setup.py si absent
           if [ ! -f "setup.py" ]; then
+            echo "⚠️ setup.py manquant, création automatique..."
             cat > setup.py << 'EOF'
           from setuptools import setup, find_packages
           
@@ -141,22 +211,49 @@ jobs:
           EOF
           fi
           
-          pip install -e .
-          [ -f "requirements.txt" ] && pip install -r requirements.txt || pip install opencv-python numpy tflite-runtime
+          # Installer le package
+          pip install -e . -q
           
-          python - << 'PY'
+          # Installer requirements.txt si disponible
+          if [ -f "requirements.txt" ]; then
+            pip install -r requirements.txt -q
+          else
+            pip install opencv-python numpy tflite-runtime -q
+          fi
+          
+          echo "✅ Dépendances installées"
+          echo ""
+          echo "🧪 Test de chargement du modèle..."
+          
+          # Test de validation
+          python3 - << 'PY'
           import sys, os
           sys.path.insert(0, '.')
+          
           try:
               from app.inference import EdgeDetector
+              
               model_files = [f for f in os.listdir('models') if f.endswith('.tflite')]
-              if model_files:
-                  detector = EdgeDetector(f'models/{model_files[0]}')
-                  print(f"SUCCÈS: Modèle chargé ({detector.input_width}x{detector.input_height})")
-              print("Validation réussie")
+              
+              if not model_files:
+                  print("❌ Aucun modèle .tflite trouvé")
+                  exit(1)
+              
+              print(f"Modèles disponibles: {len(model_files)}")
+              
+              # Tester le premier modèle
+              test_model = f'models/{model_files[0]}'
+              print(f"Test du modèle: {model_files[0]}")
+              
+              detector = EdgeDetector(test_model)
+              print(f"✅ SUCCÈS: Modèle chargé")
+              print(f"   Dimensions: {detector.input_width}x{detector.input_height}")
+              print(f"   Type d'entrée: {detector.input_details[0]['dtype']}")
+              
           except Exception as e:
-              print(f"ERREUR: {e}")
-              import traceback; traceback.print_exc()
+              print(f"❌ ERREUR lors du chargement: {e}")
+              import traceback
+              traceback.print_exc()
               exit(1)
           PY
           
@@ -165,28 +262,49 @@ jobs:
       - name: Tests de base
         if: steps.check-models.outputs.exist == 'true' && steps.validate-setup.outputs.success == 'true'
         run: |
+          echo "🧪 Exécution des tests de base..."
+          
           cat > basic_test.py << 'EOF'
           import sys, os, numpy as np
           sys.path.insert(0, os.getcwd())
           from app.inference import EdgeDetector
           
-          print("=== TESTS DE BASE - feature/add ===")
+          print("=== TESTS DE BASE - feature/add ===\n")
+          
           model_files = [f for f in os.listdir('models') if f.endswith('.tflite')]
+          
           if not model_files:
-              print("Aucun modèle trouvé")
+              print("❌ Aucun modèle trouvé")
               exit(1)
           
-          for model_file in model_files[:2]:
-              print(f"\nTest: {model_file}")
-              detector = EdgeDetector(f"models/{model_file}")
-              test_img = np.random.randint(0, 255, (320, 320, 3), dtype=np.uint8)
-              boxes, classes, scores, latency = detector.predict(test_img)
-              print(f"Inférence: {latency:.1f}ms, {len(scores)} détections")
+          print(f"Nombre de modèles à tester: {min(len(model_files), 2)}\n")
           
-          print("Tests de base réussis")
+          for model_file in model_files[:2]:
+              print(f"🔬 Test: {model_file}")
+              print("-" * 50)
+              
+              try:
+                  detector = EdgeDetector(f"models/{model_file}")
+                  
+                  # Créer une image de test
+                  test_img = np.random.randint(0, 255, (320, 320, 3), dtype=np.uint8)
+                  
+                  # Prédiction
+                  boxes, classes, scores, latency = detector.predict(test_img)
+                  
+                  print(f"  ✓ Inférence: {latency:.1f}ms")
+                  print(f"  ✓ Détections: {len(scores)}")
+                  print(f"  ✓ FPS estimé: {1000/latency:.1f}")
+                  print()
+                  
+              except Exception as e:
+                  print(f"  ❌ Erreur: {e}\n")
+                  exit(1)
+          
+          print("✅ Tous les tests de base ont réussi")
           EOF
           
-          python basic_test.py
+          python3 basic_test.py
 
   performance-benchmark:
     name: Benchmark Performance
@@ -201,31 +319,42 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configuration Python et DVC
+      - name: Configuration Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Installation dépendances
+      - name: Installation DVC et dépendances
         run: |
-          pip install -e .
-          pip install opencv-python numpy pandas "dvc[gdrive]==3.41.0"
+          pip install "dvc[gdrive]==${{ env.DVC_VERSION }}" -q
+          pip install opencv-python numpy pandas -q
 
-      - name: Configuration DVC avec Service Account
+      - name: Configuration Google Drive
         env:
-          SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
+          GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
         run: |
-          mkdir -p /tmp/dvc-gdrive
-          echo "$SERVICE_ACCOUNT_JSON" > /tmp/dvc-gdrive/service_account.json
+          mkdir -p ~/.dvc
+          echo "$GDRIVE_CREDENTIALS_JSON" > ~/.dvc/gdrive_service_account.json
           
-          dvc remote modify --local vdrive gdrive_use_service_account true
-          dvc remote modify --local vdrive gdrive_service_account_json_file_path /tmp/dvc-gdrive/service_account.json
-          dvc remote modify --local vdrive gdrive_acknowledge_abuse true
+          REMOTE_NAME=$(dvc remote list 2>/dev/null | head -n1 | awk '{print $1}' || echo "gdrive")
+          
+          dvc remote modify --local "$REMOTE_NAME" gdrive_use_service_account true
+          dvc remote modify --local "$REMOTE_NAME" gdrive_service_account_json_file_path "$HOME/.dvc/gdrive_service_account.json"
+          dvc remote modify --local "$REMOTE_NAME" gdrive_acknowledge_abuse true
 
-      - name: Récupération modèles si nécessaire
+      - name: Récupération modèles
         run: |
-          if [ -f "models.dvc" ] && [ ! "$(ls -A models/*.tflite 2>/dev/null)" ]; then
-            dvc pull models.dvc --verbose
+          if [ ! -d "models" ] || [ -z "$(ls -A models/*.tflite 2>/dev/null)" ]; then
+            echo "📥 Récupération des modèles..."
+            dvc pull models.dvc
+          else
+            echo "✅ Modèles déjà disponibles"
+          fi
+
+      - name: Installation du package
+        run: |
+          if [ -f "setup.py" ]; then
+            pip install -e . -q
           fi
 
       - name: Exécution du benchmark
@@ -233,48 +362,93 @@ jobs:
         env:
           TF_ENABLE_ONEDNN_OPTS: "0"
         run: |
+          echo "🚀 Démarrage du benchmark de performance..."
+          
           cat > benchmark.py << 'EOF'
           import os, json, numpy as np, time
           from app.inference import EdgeDetector
           
+          print("=== BENCHMARK DE PERFORMANCE ===\n")
+          
           results = []
-          for model_file in os.listdir('models'):
-              if not model_file.endswith('.tflite'): continue
+          model_files = [f for f in os.listdir('models') if f.endswith('.tflite')]
+          
+          print(f"Modèles à benchmarker: {len(model_files)}\n")
+          
+          for model_file in model_files:
               model_path = f"models/{model_file}"
+              print(f"📊 Benchmark: {model_file}")
+              print("-" * 60)
+              
               try:
                   detector = EdgeDetector(model_path)
-                  test_img = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-                  for _ in range(3): detector.predict(test_img)
                   
+                  # Image de test
+                  test_img = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+                  
+                  # Warm-up
+                  print("  Warm-up (3 itérations)...")
+                  for _ in range(3):
+                      detector.predict(test_img)
+                  
+                  # Mesures
+                  print("  Mesures (15 itérations)...")
                   latencies = []
-                  for _ in range(15):
+                  for i in range(15):
                       start = time.perf_counter()
                       _, _, _, latency = detector.predict(test_img)
                       latencies.append(latency)
                   
-                  avg = np.mean(latencies)
-                  fps = 1000 / avg if avg > 0 else 0
-                  meets = fps >= 15 and avg <= 100
+                  # Statistiques
+                  avg_latency = np.mean(latencies)
+                  min_latency = np.min(latencies)
+                  max_latency = np.max(latencies)
+                  std_latency = np.std(latencies)
+                  fps = 1000 / avg_latency if avg_latency > 0 else 0
                   
-                  results.append({
+                  # Critères de production
+                  meets_requirements = fps >= 15 and avg_latency <= 100
+                  
+                  result = {
                       "model": model_file,
                       "size_mb": round(os.path.getsize(model_path) / (1024*1024), 2),
-                      "avg_latency_ms": round(avg, 2),
+                      "avg_latency_ms": round(avg_latency, 2),
+                      "min_latency_ms": round(min_latency, 2),
+                      "max_latency_ms": round(max_latency, 2),
+                      "std_latency_ms": round(std_latency, 2),
                       "fps": round(fps, 2),
-                      "meets_requirements": meets
-                  })
+                      "meets_requirements": meets_requirements
+                  }
+                  
+                  results.append(result)
+                  
+                  print(f"  ✓ Latence moyenne: {avg_latency:.2f}ms (±{std_latency:.2f})")
+                  print(f"  ✓ Latence min/max: {min_latency:.2f}ms / {max_latency:.2f}ms")
+                  print(f"  ✓ FPS: {fps:.2f}")
+                  print(f"  ✓ Taille: {result['size_mb']:.2f} MB")
+                  print(f"  {'✅' if meets_requirements else '❌'} Prêt pour production: {'OUI' if meets_requirements else 'NON'}")
+                  print()
+                  
               except Exception as e:
-                  print(f"Erreur sur {model_file}: {e}")
+                  print(f"  ❌ Erreur: {e}\n")
           
+          # Sauvegarder les résultats
           with open('benchmark_results.json', 'w') as f:
               json.dump(results, f, indent=2)
           
+          # Compte des modèles prêts
           ready_count = sum(r["meets_requirements"] for r in results)
+          
+          print(f"\n{'='*60}")
+          print(f"RÉSUMÉ: {ready_count}/{len(results)} modèles prêts pour la production")
+          print(f"{'='*60}")
+          
+          # Output pour GitHub Actions
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write(f"production_ready_count={ready_count}\n")
           EOF
           
-          python benchmark.py
+          python3 benchmark.py
 
       - name: Upload résultats benchmark
         uses: actions/upload-artifact@v4
@@ -294,77 +468,122 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configuration Python et DVC
+      - name: Configuration Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Installation dépendances
         run: |
-          pip install mlflow pandas "dvc[gdrive]==3.41.0"
-          pip install -e .
+          pip install mlflow pandas "dvc[gdrive]==${{ env.DVC_VERSION }}" -q
+          [ -f "setup.py" ] && pip install -e . -q || true
 
-      - name: Configuration DVC avec Service Account
+      - name: Configuration Google Drive
         env:
-          SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
+          GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
         run: |
-          mkdir -p /tmp/dvc-gdrive
-          echo "$SERVICE_ACCOUNT_JSON" > /tmp/dvc-gdrive/service_account.json
+          mkdir -p ~/.dvc
+          echo "$GDRIVE_CREDENTIALS_JSON" > ~/.dvc/gdrive_service_account.json
           
-          dvc remote modify --local vdrive gdrive_use_service_account true
-          dvc remote modify --local vdrive gdrive_service_account_json_file_path /tmp/dvc-gdrive/service_account.json
-          dvc remote modify --local vdrive gdrive_acknowledge_abuse true
+          REMOTE_NAME=$(dvc remote list 2>/dev/null | head -n1 | awk '{print $1}' || echo "gdrive")
+          
+          dvc remote modify --local "$REMOTE_NAME" gdrive_use_service_account true
+          dvc remote modify --local "$REMOTE_NAME" gdrive_service_account_json_file_path "$HOME/.dvc/gdrive_service_account.json"
+          dvc remote modify --local "$REMOTE_NAME" gdrive_acknowledge_abuse true
 
-      - name: Récupération modèles si nécessaire
+      - name: Récupération modèles
         run: |
           if [ ! -d "models" ] || [ -z "$(ls models/*.tflite 2>/dev/null)" ]; then
-            dvc pull models.dvc --verbose
+            dvc pull models.dvc
           fi
+
+      - name: Téléchargement résultats benchmark
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-feature-results
+          path: .
 
       - name: Enregistrement MLflow
         env:
           MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
         run: |
+          echo "📊 Enregistrement des modèles dans MLflow..."
+          
           cat > register_staging.py << 'EOF'
           import mlflow, os, json
           from datetime import datetime
           
           mlflow.set_experiment("Edge_Security_Feature_Staging")
+          
+          # Charger les résultats de benchmark
           benchmark = []
           if os.path.exists('benchmark_results.json'):
               with open('benchmark_results.json') as f:
                   benchmark = json.load(f)
+              print(f"✅ {len(benchmark)} résultats de benchmark chargés\n")
           
           registered = []
+          
           for model_file in os.listdir('models'):
-              if not model_file.endswith('.tflite'): continue
-              model_path = f"models/{model_file}"
-              name = model_file.replace('.tflite', '')
+              if not model_file.endswith('.tflite'):
+                  continue
               
+              model_path = f"models/{model_file}"
+              model_name = model_file.replace('.tflite', '')
+              
+              print(f"📝 Enregistrement: {model_file}")
+              
+              # Trouver les métriques de benchmark
               bm = next((b for b in benchmark if b['model'] == model_file), None)
               
-              with mlflow.start_run(run_name=f"feature_add_{name}_{datetime.now():%Y%m%d_%H%M}"):
+              with mlflow.start_run(run_name=f"feature_add_{model_name}_{datetime.now():%Y%m%d_%H%M}"):
+                  # Paramètres
                   mlflow.log_params({
-                      "model_name": name, "branch": "feature/add",
-                      "quantization": "int8" if "int8" in name.lower() else "float32",
-                      "framework": "tensorflow_lite", "environment": "staging",
-                      "git_commit": "${{ github.sha }}"
+                      "model_name": model_name,
+                      "branch": "feature/add",
+                      "quantization": "int8" if "int8" in model_name.lower() else "float32",
+                      "framework": "tensorflow_lite",
+                      "environment": "staging",
+                      "git_commit": "${{ github.sha }}",
+                      "git_author": "${{ github.actor }}"
                   })
+                  
+                  # Métriques
                   if bm:
                       mlflow.log_metrics({
-                          "fps": bm['fps'], "latency_ms": bm['avg_latency_ms'],
-                          "model_size_mb": bm['size_mb']
+                          "fps": bm['fps'],
+                          "latency_ms": bm['avg_latency_ms'],
+                          "latency_min_ms": bm.get('min_latency_ms', 0),
+                          "latency_max_ms": bm.get('max_latency_ms', 0),
+                          "latency_std_ms": bm.get('std_latency_ms', 0),
+                          "model_size_mb": bm['size_mb'],
+                          "production_ready": 1 if bm['meets_requirements'] else 0
                       })
+                      print(f"  ✓ Métriques: {bm['fps']:.1f} FPS, {bm['avg_latency_ms']:.1f}ms")
+                  
+                  # Artifacts
                   mlflow.log_artifact(model_path, "models")
-                  mlflow.log_artifact("app/inference.py", "code")
+                  if os.path.exists("app/inference.py"):
+                      mlflow.log_artifact("app/inference.py", "code")
+                  
                   registered.append(model_file)
+                  print(f"  ✅ Enregistré\n")
           
-          report = {"total_registered": len(registered), "models": registered, "branch": "feature/add"}
+          # Rapport
+          report = {
+              "total_registered": len(registered),
+              "models": registered,
+              "branch": "feature/add",
+              "timestamp": datetime.now().isoformat()
+          }
+          
           with open('staging_registration_report.json', 'w') as f:
               json.dump(report, f, indent=2)
+          
+          print(f"✅ {len(registered)} modèles enregistrés dans MLflow")
           EOF
           
-          python register_staging.py
+          python3 register_staging.py
 
       - name: Upload rapport MLflow
         uses: actions/upload-artifact@v4
@@ -389,58 +608,88 @@ jobs:
 
       - name: Génération rapport final
         run: |
-          cat > final_feature_report.md << 'EOF'
-          # Rapport Pipeline MLOps - Branche feature/add
+          cat > final_feature_report.md << 'MDEOF'
+          # 📊 Rapport Pipeline MLOps - Branche feature/add
           
-          **Projet:** Détection d'intrusion Edge Security
-          **Date:** $(date)
-          **Branche:** feature/add
-          **Commit:** ${{ github.sha }}
-          **Run ID:** ${{ github.run_id }}
+          **Projet:** Détection d'intrusion Edge Security  
+          **Date:** $(date '+%Y-%m-%d %H:%M:%S')  
+          **Branche:** feature/add  
+          **Commit:** ${{ github.sha }}  
+          **Run ID:** ${{ github.run_id }}  
+          **Workflow:** ${{ github.workflow }}
           
-          ## Statut des étapes
+          ---
+          
+          ## ✅ Statut des étapes
+          
           | Étape                  | Statut   | Détails                                      |
           |------------------------|----------|----------------------------------------------|
-          | Setup & Validation     | ${{ needs.setup-and-validation.result }} | ${{ needs.setup-and-validation.outputs.models_count || 0 }} modèles |
-          | Benchmark Performance  | ${{ needs.performance-benchmark.result }} | ${{ needs.performance-benchmark.outputs.production_ready_count || 0 }} prêts |
+          | Setup & Validation     | ${{ needs.setup-and-validation.result }} | ${{ needs.setup-and-validation.outputs.models_count || 0 }} modèles détectés |
+          | Benchmark Performance  | ${{ needs.performance-benchmark.result }} | ${{ needs.performance-benchmark.outputs.production_ready_count || 0 }} modèles prêts |
           | MLflow Staging         | ${{ needs.mlflow-registration-staging.result }} | Enregistrement staging |
           
-          ## Performance des modèles
-          EOF
+          ---
+          
+          ## 📈 Performance des modèles
+          
+          MDEOF
           
           if [ -f "artifacts/benchmark_results.json" ]; then
             python3 - << 'PY'
           import json
+          
           with open('artifacts/benchmark_results.json') as f:
               data = json.load(f)
-          print("| Modèle | Taille (MB) | FPS | Latence (ms) | Prêt |")
-          print("|--------|-------------|-----|--------------|------|")
-          ready = 0
-          for m in data:
-              r = "OUI" if m['meets_requirements'] else "NON"
-              if m['meets_requirements']: ready += 1
-              print(f"| {m['model']} | {m['size_mb']:.1f} | {m['fps']:.1f} | {m['avg_latency_ms']:.1f} | {r} |")
-          print(f"\n**Modèles prêts production:** {ready}/{len(data)}")
+          
+          print("\n| Modèle | Taille | FPS | Latence (ms) | Prêt Prod |")
+          print("|--------|--------|-----|--------------|-----------|")
+          
+          ready_count = 0
+          for m in sorted(data, key=lambda x: x['fps'], reverse=True):
+              status = "✅ OUI" if m['meets_requirements'] else "❌ NON"
+              if m['meets_requirements']:
+                  ready_count += 1
+              
+              print(f"| {m['model'][:40]} | {m['size_mb']:.1f} MB | {m['fps']:.1f} | {m['avg_latency_ms']:.1f} | {status} |")
+          
+          print(f"\n**📊 Résumé:** {ready_count}/{len(data)} modèles atteignent les critères de production")
+          print(f"- Critère FPS: ≥ 15")
+          print(f"- Critère Latence: ≤ 100ms")
           PY
             >> final_feature_report.md
           else
-            echo "Aucune donnée de benchmark disponible" >> final_feature_report.md
+            echo "⚠️ Aucune donnée de benchmark disponible" >> final_feature_report.md
           fi
           
-          cat >> final_feature_report.md << 'EOF'
+          cat >> final_feature_report.md << 'MDEOF'
           
-          ## Recommandations
-          1. Vérifier que tous les tests passent
-          2. S'assurer que les modèles atteignent ≥15 FPS et ≤100ms
-          3. Créer une PR vers main une fois validé
-          4. Mettre à jour la documentation si nécessaire
+          ---
           
-          ## Artifacts disponibles
-          - benchmark_results.json
-          - staging_registration_report.json
-          EOF
+          ## 📋 Recommandations
           
+          1. ✅ Vérifier que tous les tests passent
+          2. ✅ S'assurer que les modèles atteignent ≥15 FPS et ≤100ms
+          3. 📝 Créer une Pull Request vers `main` une fois validé
+          4. 📚 Mettre à jour la documentation si nécessaire
+          5. 🔍 Réviser le code avec l'équipe
+          
+          ---
+          
+          ## 📦 Artifacts disponibles
+          
+          - `benchmark_results.json` - Résultats détaillés des benchmarks
+          - `staging_registration_report.json` - Rapport d'enregistrement MLflow
+          
+          ---
+          
+          *Généré automatiquement par GitHub Actions*
+          MDEOF
+          
+          echo ""
+          echo "📄 Rapport final généré:"
+          echo "================================"
           cat final_feature_report.md
+          echo "================================"
 
       - name: Upload rapport final
         uses: actions/upload-artifact@v4
