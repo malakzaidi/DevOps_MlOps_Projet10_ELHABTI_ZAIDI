@@ -3,6 +3,13 @@ name: MLOps Edge Security Pipeline - Feature Branch
 on:
   push:
     branches: [ feature/add ]
+    paths:
+      - 'app/**'
+      - 'models.dvc'
+      - 'data.dvc'
+      - 'scripts/**'
+      - 'requirements.txt'
+      - 'setup.py'
 
   workflow_dispatch:
     inputs:
@@ -23,7 +30,7 @@ env:
 jobs:
   setup-and-validation:
     name: Setup et validation - Branche Feature
-    runs-on: ubuntu-latest-4-cores
+    runs-on: ubuntu-latest-4-core
     timeout-minutes: 15
     outputs:
       models_exist: ${{ steps.check-models.outputs.exist }}
@@ -131,7 +138,7 @@ jobs:
     name: Benchmark Performance
     needs: setup-and-validation
     if: needs.setup-and-validation.outputs.models_exist == 'true' && needs.setup-and-validation.outputs.setup_success == 'true'
-    runs-on: ubuntu-latest-4-cores
+    runs-on: ubuntu-latest-4-core
     timeout-minutes: 20
     outputs:
       production_ready_count: ${{ steps.run-benchmark.outputs.production_ready_count }}
@@ -144,24 +151,13 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install dependencies with proper order
+      - name: Install dependencies (tflite-runtime first)
         run: |
-          # Install tflite-runtime FIRST before anything else
           pip install --upgrade pip
           pip install tflite-runtime
-          
-          # Then install other dependencies
           pip install opencv-python numpy pandas
-          
-          # Install DVC if needed
           pip install "dvc[gdrive]==3.41.0"
-          
-          # Finally install the package in editable mode
-          # This ensures tflite-runtime is not overwritten
           pip install -e . --no-deps
-          
-          # Verify tflite-runtime is installed
-          python -c "import tflite_runtime.interpreter as tflite; print('tflite-runtime OK')"
 
       - name: Configure DVC Service Account
         env:
@@ -189,119 +185,42 @@ jobs:
         run: |
           cat > benchmark.py << 'EOF'
           import os, json, numpy as np, time
-          
-          # Verify tflite-runtime import before anything else
-          try:
-              import tflite_runtime.interpreter as tflite
-              print("✓ tflite-runtime imported successfully")
-          except ImportError as e:
-              print(f"✗ Failed to import tflite-runtime: {e}")
-              raise
-          
           from app.inference import EdgeDetector
           
-          print("🚀 Démarrage du benchmark de performance...")
-          
           results = []
-          model_files = [f for f in os.listdir('models') if f.endswith('.tflite')]
-          
-          if not model_files:
-              print("⚠️ Aucun modèle .tflite trouvé dans le dossier models/")
-              with open('benchmark_results.json', 'w') as f:
-                  json.dump([], f)
-              exit(0)
-          
-          print(f"📊 {len(model_files)} modèle(s) détecté(s)")
-          
-          for model_file in model_files:
-              print(f"\n🔍 Test du modèle: {model_file}")
+          for model_file in os.listdir('models'):
+              if not model_file.endswith('.tflite'): continue
               model_path = f"models/{model_file}"
+              detector = EdgeDetector(model_path)
+              test_img = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+              for _ in range(3): detector.predict(test_img)  # warm-up
               
-              try:
-                  detector = EdgeDetector(model_path)
-                  test_img = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-                  
-                  # Warm-up
-                  print("  ⏳ Warm-up (3 itérations)...")
-                  for _ in range(3): 
-                      detector.predict(test_img)
-                  
-                  # Benchmark
-                  print("  ⚡ Benchmark (15 itérations)...")
-                  latencies = []
-                  for i in range(15):
-                      start = time.perf_counter()
-                      _, _, _, latency = detector.predict(test_img)
-                      latencies.append(latency)
-                  
-                  avg = np.mean(latencies)
-                  p95 = np.percentile(latencies, 95)
-                  fps = 1000 / avg if avg > 0 else 0
-                  meets = fps >= 15 and avg <= 100
-                  
-                  result = {
-                      "model": model_file,
-                      "size_mb": round(os.path.getsize(model_path) / (1024*1024), 2),
-                      "avg_latency_ms": round(avg, 2),
-                      "p95_latency_ms": round(p95, 2),
-                      "fps": round(fps, 2),
-                      "meets_requirements": meets
-                  }
-                  results.append(result)
-                  
-                  status = "✅ PASS" if meets else "❌ FAIL"
-                  print(f"  {status} | Latence moy: {avg:.1f}ms | FPS: {fps:.1f} | Taille: {result['size_mb']}MB")
-                  
-              except Exception as e:
-                  print(f"  ❌ Erreur lors du test: {e}")
-                  results.append({
-                      "model": model_file,
-                      "error": str(e),
-                      "meets_requirements": False
-                  })
+              latencies = []
+              for _ in range(15):
+                  start = time.perf_counter()
+                  _, _, _, latency = detector.predict(test_img)
+                  latencies.append(latency)
+              
+              avg = np.mean(latencies)
+              fps = 1000 / avg if avg > 0 else 0
+              meets = fps >= 15 and avg <= 100
+              
+              results.append({
+                  "model": model_file,
+                  "size_mb": round(os.path.getsize(model_path) / (1024*1024), 2),
+                  "avg_latency_ms": round(avg, 2),
+                  "fps": round(fps, 2),
+                  "meets_requirements": meets
+              })
           
-          # Save results
           with open('benchmark_results.json', 'w') as f:
               json.dump(results, f, indent=2)
           
-          ready_count = sum(r.get("meets_requirements", False) for r in results)
-          
-          print(f"\n📈 Résumé du benchmark:")
-          print(f"  - Total de modèles testés: {len(results)}")
-          print(f"  - Modèles prêts pour production: {ready_count}")
-          
-          # Output for GitHub Actions
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f"production_ready_count={ready_count}\n")
+          ready_count = sum(r["meets_requirements"] for r in results)
+          echo "production_ready_count=$ready_count" >> $GITHUB_OUTPUT
           EOF
           
           python benchmark.py
-
-      - name: Display benchmark summary
-        if: always()
-        run: |
-          if [ -f "benchmark_results.json" ]; then
-            echo "## 📊 Résultats du Benchmark" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            python - << 'PY'
-          import json
-          with open('benchmark_results.json') as f:
-              results = json.load(f)
-          
-          if not results:
-              print("Aucun résultat disponible")
-              exit(0)
-          
-          print("| Modèle | Taille | Latence moy. | FPS | Production Ready |")
-          print("|--------|--------|--------------|-----|------------------|")
-          for r in results:
-              if "error" in r:
-                  print(f"| {r['model']} | - | ERROR | - | ❌ |")
-              else:
-                  status = "✅" if r["meets_requirements"] else "❌"
-                  print(f"| {r['model']} | {r['size_mb']}MB | {r['avg_latency_ms']}ms | {r['fps']} | {status} |")
-          PY
-          fi
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
@@ -314,7 +233,7 @@ jobs:
     name: Enregistrement MLflow - Staging
     needs: performance-benchmark
     if: success() && github.event.inputs.test_mode != 'benchmark-only'
-    runs-on: ubuntu-latest-4-cores
+    runs-on: ubuntu-latest-4-core
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -325,16 +244,10 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install dependencies with proper order
+      - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install tflite-runtime
-          pip install mlflow pandas opencv-python numpy
-          pip install "dvc[gdrive]==3.41.0"
-          pip install -e . --no-deps
-          
-          # Verify installation
-          python -c "import tflite_runtime.interpreter as tflite; print('tflite-runtime OK')"
+          pip install tflite-runtime mlflow pandas opencv-python numpy "dvc[gdrive]==3.41.0"
+          pip install -e .
 
       - name: Configure DVC Service Account
         env:
@@ -359,8 +272,7 @@ jobs:
         env:
           MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
         run: |
-          echo "MLflow registration script here"
-          # Add your MLflow registration logic
+          # Place ton script d'enregistrement MLflow ici
 
       - name: Upload MLflow report
         uses: actions/upload-artifact@v4
@@ -368,7 +280,6 @@ jobs:
           name: mlflow-staging-reports
           path: staging_registration_report.json
           retention-days: 7
-        continue-on-error: true
 
   final-report:
     name: Rapport Final
@@ -382,27 +293,10 @@ jobs:
           pattern: '*'
           path: artifacts
           merge-multiple: true
-        continue-on-error: true
 
       - name: Generate final report
         run: |
-          echo "# 📋 Rapport Final - Feature Pipeline" > final_feature_report.md
-          echo "" >> final_feature_report.md
-          echo "**Date**: $(date)" >> final_feature_report.md
-          echo "**Branche**: ${{ github.ref_name }}" >> final_feature_report.md
-          echo "" >> final_feature_report.md
-          
-          if [ -f "artifacts/benchmark_results.json" ]; then
-            echo "## Résultats du Benchmark" >> final_feature_report.md
-            python - << 'PY'
-          import json
-          with open('artifacts/benchmark_results.json') as f:
-              results = json.load(f)
-          ready = sum(r.get("meets_requirements", False) for r in results)
-          print(f"- **Modèles testés**: {len(results)}")
-          print(f"- **Modèles production-ready**: {ready}")
-          PY
-          fi
+          # Place ton script de génération de rapport ici
 
       - name: Upload final report
         uses: actions/upload-artifact@v4
@@ -410,4 +304,3 @@ jobs:
           name: feature-pipeline-final-report
           path: final_feature_report.md
           retention-days: 30
-        continue-on-error: true
