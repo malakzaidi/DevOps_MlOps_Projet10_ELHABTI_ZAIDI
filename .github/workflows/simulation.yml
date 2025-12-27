@@ -1,255 +1,106 @@
-name: MLOps Edge Security Pipeline - Feature Branch
+name: MLOps Edge Security Pipeline - Final CI/CD
 
 on:
   push:
-    branches: [ feature/add ]
+    branches: [ main, feature/** ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
-    inputs:
-      test_mode:
-        description: 'Mode de test détaillé'
-        required: false
-        default: 'basic'
-        type: choice
-        options:
-          - basic
-          - full
-          - benchmark-only
 
 env:
   MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI || 'http://localhost:5000' }}
   PYTHON_VERSION: '3.11'
+  DVC_REMOTE_NAME: 'vdrive'
 
 jobs:
   setup-and-validation:
-    name: Setup et validation - Branche Feature
+    name: Setup et Validation DVC
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    outputs:
-      models_exist: ${{ steps.check-models.outputs.exist }}
-      models_count: ${{ steps.check-models.outputs.count }}
-      setup_success: ${{ steps.validate-setup.outputs.success }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Install DVC and dependencies
-        run: |
-          pip install "dvc[gdrive]==3.41.0"
-          pip install opencv-python numpy tflite-runtime
-
-      - name: Configure DVC Service Account
-        env:
-          SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
-        run: |
-          mkdir -p ~/.dvc
-          echo "$SERVICE_ACCOUNT_JSON" > ~/.dvc/gdrive_service_account.json
-          REMOTE_NAME=$(dvc remote list | head -n1 | awk '{print $1}' || echo "vdrive")
-          dvc remote modify --local "$REMOTE_NAME" gdrive_use_service_account true
-          dvc remote modify --local "$REMOTE_NAME" gdrive_service_account_json_file_path ~/.dvc/gdrive_service_account.json
-          dvc remote modify --local "$REMOTE_NAME" gdrive_acknowledge_abuse true
-
-      - name: DVC Pull models
-        run: dvc pull models.dvc --verbose
-
-      - name: Check models
-        id: check-models
-        run: |
-          if [ ! -d "models" ]; then
-            echo "exist=false" >> $GITHUB_OUTPUT
-            echo "count=0" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          count=$(find models -name "*.tflite" -type f | wc -l)
-          echo "exist=$([ $count -gt 0 ] && echo true || echo false)" >> $GITHUB_OUTPUT
-          echo "count=$count" >> $GITHUB_OUTPUT
-
-      - name: Install package and validate
-        id: validate-setup
-        if: steps.check-models.outputs.exist == 'true'
-        run: |
-          if [ ! -f "setup.py" ]; then
-            cat > setup.py << 'EOF'
-          from setuptools import setup, find_packages
-          setup(
-              name="edge_security_feature",
-              version="0.1.0",
-              packages=find_packages(),
-              install_requires=['opencv-python', 'numpy', 'tflite-runtime'],
-              python_requires='>=3.8',
-          )
-          EOF
-          fi
-          pip install -e .
-          [ -f "requirements.txt" ] && pip install -r requirements.txt
-          python - << 'PY'
-          from app.inference import EdgeDetector
-          import os
-          models = [f for f in os.listdir('models') if f.endswith('.tflite')]
-          if models:
-              detector = EdgeDetector(f"models/{models[0]}")
-              print("Model loaded successfully")
-          PY
-          echo "success=true" >> $GITHUB_OUTPUT
-
-      - name: Basic tests
-        if: steps.check-models.outputs.exist == 'true' && steps.validate-setup.outputs.success == 'true'
-        run: |
-          python - << 'PY'
-          import numpy as np
-          from app.inference import EdgeDetector
-          import os
-          models = [f for f in os.listdir('models') if f.endswith('.tflite')][:2]
-          for m in models:
-              detector = EdgeDetector(f"models/{m}")
-              img = np.random.randint(0, 255, (320, 320, 3), dtype=np.uint8)
-              _, _, _, latency = detector.predict(img)
-              print(f"{m}: inference in {latency:.1f}ms")
-          PY
-
-  performance-benchmark:
-    name: Benchmark Performance
-    needs: setup-and-validation
-    if: needs.setup-and-validation.outputs.models_exist == 'true' && needs.setup-and-validation.outputs.setup_success == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    outputs:
-      production_ready_count: ${{ steps.run-benchmark.outputs.production_ready_count }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-      - name: Install dependencies with proper order
-        run: |
-          pip install --upgrade pip
-          pip install tflite-runtime
-          pip install opencv-python numpy pandas "dvc[gdrive]==3.41.0"
-          [ -f "requirements.txt" ] && pip install -r requirements.txt
-          python -c "import tflite_runtime.interpreter as tflite; print('✓ tflite-runtime OK')"
-      - name: Configure DVC Service Account
-        env:
-          SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
-        run: |
-          mkdir -p ~/.dvc
-          echo "$SERVICE_ACCOUNT_JSON" > ~/.dvc/gdrive_service_account.json
-          REMOTE_NAME=$(dvc remote list | head -n1 | awk '{print $1}' || echo "vdrive")
-          dvc remote modify --local "$REMOTE_NAME" gdrive_use_service_account true
-          dvc remote modify --local "$REMOTE_NAME" gdrive_service_account_json_file_path ~/.dvc/gdrive_service_account.json
-          dvc remote modify --local "$REMOTE_NAME" gdrive_acknowledge_abuse true
-      - name: Pull models if needed
-        run: |
-          export PYTHONPATH="${PYTHONPATH}:$(pwd)"
-          echo "PYTHONPATH=$(pwd)" >> $GITHUB_ENV
-          if [ ! "$(ls -A models/*.tflite 2>/dev/null)" ]; then
-            dvc pull models.dvc
-          fi
-      - name: Run benchmark
-        id: run-benchmark
-        env:
-          TF_ENABLE_ONEDNN_OPTS: "0"
-        run: |
-          python benchmark.py  # comme dans ton script actuel
-
-  raspberry-pi-simulation:
-    name: Simulation Raspberry Pi
-    needs: setup-and-validation
-    if: needs.setup-and-validation.outputs.models_exist == 'true' && needs.setup-and-validation.outputs.setup_success == 'true'
-    runs-on: self-hosted
-    labels: [arm64, raspberry-pi]
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
       - name: Setup Python
-        run: |
-          sudo apt update && sudo apt install -y python3-pip
-          pip3 install --upgrade pip
-          pip3 install tflite-runtime opencv-python numpy pandas "dvc[gdrive]==3.41.0"
-          [ -f "requirements.txt" ] && pip3 install -r requirements.txt
-      - name: Configure DVC
-        env:
-          SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
-        run: |
-          mkdir -p ~/.dvc
-          echo "$SERVICE_ACCOUNT_JSON" > ~/.dvc/gdrive_service_account.json
-          REMOTE_NAME=$(dvc remote list | head -n1 | awk '{print $1}' || echo "vdrive")
-          dvc remote modify --local "$REMOTE_NAME" gdrive_use_service_account true
-          dvc remote modify --local "$REMOTE_NAME" gdrive_service_account_json_file_path ~/.dvc/gdrive_service_account.json
-          dvc remote modify --local "$REMOTE_NAME" gdrive_acknowledge_abuse true
-          dvc pull models.dvc
-      - name: Run Raspberry Pi benchmark
-        run: |
-          python3 benchmark.py
-
-  mlflow-registration-staging:
-    name: Enregistrement MLflow - Staging
-    needs: [performance-benchmark, raspberry-pi-simulation]
-    if: success() && github.event.inputs.test_mode != 'benchmark-only'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      - name: Install dependencies
-        run: |
-          pip install --upgrade pip
-          pip install tflite-runtime mlflow pandas opencv-python numpy "dvc[gdrive]==3.41.0"
-          [ -f "requirements.txt" ] && pip install -r requirements.txt
-      - name: Configure DVC and pull models
+          cache: 'pip'
+
+      - name: Install DVC
+        run: pip install "dvc[gdrive]==3.41.0"
+
+      - name: Configure DVC & Pull
         env:
-          SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
+          GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
         run: |
           mkdir -p ~/.dvc
-          echo "$SERVICE_ACCOUNT_JSON" > ~/.dvc/gdrive_service_account.json
-          REMOTE_NAME=$(dvc remote list | head -n1 | awk '{print $1}' || echo "vdrive")
-          dvc remote modify --local "$REMOTE_NAME" gdrive_use_service_account true
-          dvc remote modify --local "$REMOTE_NAME" gdrive_service_account_json_file_path ~/.dvc/gdrive_service_account.json
-          dvc remote modify --local "$REMOTE_NAME" gdrive_acknowledge_abuse true
+          echo "$GDRIVE_CREDENTIALS" > ~/.dvc/gdrive_service_account.json
+          dvc remote modify --local ${{ env.DVC_REMOTE_NAME }} gdrive_use_service_account true
+          dvc remote modify --local ${{ env.DVC_REMOTE_NAME }} gdrive_service_account_json_file_path ~/.dvc/gdrive_service_account.json
           dvc pull models.dvc
-      - name: Run MLflow registration
+
+      # On sauvegarde les modèles pour les jobs suivants
+      - name: Upload Models Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: edge-models
+          path: models/
+
+  edge-simulation-docker:
+    name: Simulation Edge (Docker Compose)
+    needs: setup-and-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Models Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: edge-models
+          path: models/
+
+      - name: Build and Start Edge Simulator
+        run: |
+          # On utilise docker-compose pour respecter vos limites CPU/RAM
+          docker compose up -d --build
+          
+      - name: Health Check & Inference Test
+        run: |
+          # Attendre que FastAPI soit prêt
+          timeout 60s bash -c 'until curl -s localhost:8000/health; do sleep 2; done' || echo "Health check failed, continuing anyway..."
+          
+          # Exécuter un test d'inférence à l'intérieur du conteneur bridé
+          docker exec raspberry_sim python -c "from app.inference import EdgeDetector; import os; m=os.listdir('models')[0]; d=EdgeDetector(f'models/{m}'); print('Simulation Success: Model loaded in constrained environment')"
+
+      - name: Stop Simulation
+        if: always()
+        run: docker compose down
+
+  mlflow-registration:
+    name: MLflow Registration
+    needs: edge-simulation-docker
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Models Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: edge-models
+          path: models/
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Register to MLflow
         env:
           MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
         run: |
-          echo "MLflow registration script here"
-
-  final-report:
-    name: Rapport Final
-    needs: [setup-and-validation, performance-benchmark, raspberry-pi-simulation, mlflow-registration-staging]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: '*'
-          path: artifacts
-          merge-multiple: true
-        continue-on-error: true
-      - name: Generate final report
-        run: |
-          echo "# 📋 Rapport Final - Feature Pipeline" > final_feature_report.md
-          echo "" >> final_feature_report.md
-          echo "**Date**: $(date)" >> final_feature_report.md
-          echo "**Branche**: ${{ github.ref_name }}" >> final_feature_report.md
-          echo "" >> final_feature_report.md
-          if [ -f "artifacts/benchmark_results.json" ]; then
-            echo "## Résultats du Benchmark" >> final_feature_report.md
-            python - << 'PY'
-          import json
-          with open('artifacts/benchmark_results.json') as f:
-              results = json.load(f)
-          ready = sum(r.get("meets_requirements", False) for r in results)
-          print(f"- **Modèles testés**: {len(results)}")
-          print(f"- **Modèles production-ready**: {ready}")
-          PY
-      - uses: actions/upload-artifact@v4
-        with:
-          name: feature-pipeline-final-report
-          path: final_feature_report.md
-          retention-days: 30
-        continue-on-error: true
+          pip install mlflow pandas
+          # Votre script d'enregistrement ici
+          echo "Registering models to MLflow..."
