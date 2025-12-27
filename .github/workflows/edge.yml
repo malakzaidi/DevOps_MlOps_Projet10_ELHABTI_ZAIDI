@@ -119,8 +119,9 @@ jobs:
       - name: Install Dependencies
         run: |
           pip install "numpy<2" psutil
+          # Correct URL format: note the underscores vs hyphens in version and filename
           pip install --no-cache-dir \
-            https://github.com/PINTO0309/TensorflowLite-bin/releases/download/v2.15.0.post1/tflite_runtime-2.15.0.post1-cp311-cp311-linux_aarch64.whl
+            https://github.com/PINTO0309/TensorflowLite-bin/releases/download/v2.15.0.post1/tflite_runtime-2.15.0post1-cp311-none-linux_aarch64.whl
       - name: Run Benchmark
         run: |
           mkdir -p results
