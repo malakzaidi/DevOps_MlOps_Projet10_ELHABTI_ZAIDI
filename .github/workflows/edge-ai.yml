@@ -1,4 +1,4 @@
-name: MLOps Edge AI - Visual Dashboard
+name: MLOps Edge AI - Visual Dashboard Fixed
 
 on:
   push:
@@ -26,10 +26,10 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
 
-      - name: Install DVC & Requirements
+      - name: Install DVC
         run: |
-          pip install "dvc[gdrive]==3.41.0" matplotlib pandas
-          echo "Environment ready with DVC and Visualization tools."
+          pip install "dvc[gdrive]==3.41.0"
+          echo "DVC installed."
 
       - name: Pull Models from DVC
         env:
@@ -100,6 +100,16 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Reporting Dependencies
+        run: |
+          pip install matplotlib pandas
+          echo "Visualization libraries installed."
+
       - name: Download All Results
         uses: actions/download-artifact@v4
         with:
@@ -117,7 +127,11 @@ jobs:
           def load_metrics(path):
               file_path = Path(path)
               if file_path.exists():
-                  return json.load(open(file_path))
+                  try:
+                      with open(file_path) as f:
+                          return json.load(f)
+                  except Exception:
+                      pass
               return {"device": "N/A", "avg_latency_ms": 0, "fps": 0}
 
           x86 = load_metrics("all-results/x86-results/x86_metrics.json")
@@ -126,8 +140,8 @@ jobs:
           # Create Dataframe for visualization
           data = {
               'Metric': ['Latency (ms)', 'FPS'],
-              'x86 Cloud': [x86['avg_latency_ms'], x86['fps']],
-              'ARM64 Edge': [arm64['avg_latency_ms'], arm64['fps']]
+              'x86 Cloud': [x86.get('avg_latency_ms', 0), x86.get('fps', 0)],
+              'ARM64 Edge': [arm64.get('avg_latency_ms', 0), arm64.get('fps', 0)]
           }
           df = pd.DataFrame(data)
 
@@ -135,28 +149,33 @@ jobs:
           fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
           
           # Latency Plot
-          df.plot(x='Metric', y=['x86 Cloud', 'ARM64 Edge'], kind='bar', ax=ax1)
-          ax1.set_title('Performance Comparison')
-          ax1.set_ylabel('Value')
+          df[df['Metric'] == 'Latency (ms)'].plot(kind='bar', ax=ax1)
+          ax1.set_title('Latency Comparison (ms)')
+          ax1.set_xticklabels(['Latency'])
+          
+          # FPS Plot
+          df[df['Metric'] == 'FPS'].plot(kind='bar', ax=ax2)
+          ax2.set_title('Throughput Comparison (FPS)')
+          ax2.set_xticklabels(['FPS'])
           
           plt.tight_layout()
           plt.savefig('performance_chart.png')
 
           # Generate Markdown Report
-          report = f"""# 📊 MLOps Edge AI Performance Dashboard
+          report = f"""#  MLOps Edge AI Performance Dashboard
 
-          ## 📝 Project Overview
+          ##  Project Overview
           This pipeline automates the benchmarking of AI models across different architectures. 
           It compares **Cloud Inference (x86)** vs **Edge Inference (ARM64)** to validate optimization techniques like Int8 Quantification.
 
-          ## 📈 Key Metrics Comparison
+          ##  Key Metrics Comparison
           | Metric | x86 Cloud (Standard) | ARM64 Edge (Simulated) | Difference |
           |--------|----------------------|------------------------|------------|
-          | **Device** | {x86['device']} | {arm64['device']} | - |
-          | **Latency**| {x86['avg_latency_ms']} ms | {arm64['avg_latency_ms']} ms | {round(arm64['avg_latency_ms'] - x86['avg_latency_ms'], 2)} ms |
-          | **FPS**    | {x86['fps']} | {arm64['fps']} | {round(arm64['fps'] - x86['fps'], 2)} |
+          | **Device** | {x86.get('device', 'N/A')} | {arm64.get('device', 'N/A')} | - |
+          | **Latency**| {x86.get('avg_latency_ms', 0)} ms | {arm64.get('avg_latency_ms', 0)} ms | {round(arm64.get('avg_latency_ms', 0) - x86.get('avg_latency_ms', 0), 2)} ms |
+          | **FPS**    | {x86.get('fps', 0)} | {arm64.get('fps', 0)} | {round(arm64.get('fps', 0) - x86.get('fps', 0), 2)} |
 
-          ## 🔍 Technical Insights
+          ##  Technical Insights
           - **x86 Cloud**: High throughput, suitable for training and heavy inference.
           - **ARM64 Edge**: Resource-constrained, target for final deployment (Raspberry Pi).
           
@@ -176,7 +195,7 @@ jobs:
           name: performance-visuals
           path: performance_chart.png
 
-      - name: Upload Final Report
+      - name: Upload Final Report Artifact
         uses: actions/upload-artifact@v4
         with:
           name: final-report
