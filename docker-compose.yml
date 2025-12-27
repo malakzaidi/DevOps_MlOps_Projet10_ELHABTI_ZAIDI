@@ -1,146 +1,21 @@
-name: MLOps Edge AI - Expert Pipeline V2
+version: '3.8'
 
-on:
-  push:
-    branches: [ feature/add ]
-  pull_request:
-    branches: [ feature/add]
-  workflow_dispatch:
-
-env:
-  MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
-  PYTHON_VERSION: '3.11'
-  DVC_REMOTE_NAME: 'vdrive'
-
-jobs:
-  setup-and-data:
-    name:  Setup & DVC Pull
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-
-      - name: Install DVC
-        run: pip install "dvc[gdrive]==3.41.0"
-
-      - name: Configure DVC & Pull
-        env:
-          GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
-        run: |
-          mkdir -p ~/.dvc
-          echo "$GDRIVE_CREDENTIALS" > ~/.dvc/gdrive_service_account.json
-          dvc remote modify --local ${{ env.DVC_REMOTE_NAME }} gdrive_use_service_account true
-          dvc remote modify --local ${{ env.DVC_REMOTE_NAME }} gdrive_service_account_json_file_path ~/.dvc/gdrive_service_account.json
-          dvc pull models.dvc
-
-      - name: Upload Models Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: edge-models
-          path: models/
-
-  benchmark-x86:
-    name:  Benchmark x86 (Cloud)
-    needs: setup-and-data
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download Models
-        uses: actions/download-artifact@v4
-        with:
-          name: edge-models
-          path: models/
-
-      - name: Build and Run Benchmark
-        run: |
-          mkdir -p results
-          # On s'assure que benchmark.py est présent dans le contexte de build
-          ls -la benchmark.py
-          
-          docker build -t edge-sim-x86 .
-          
-          # Exécution du benchmark dans le conteneur
-          docker run --rm \
-            --cpus="0.5" \
-            --memory="512m" \
-            -v $(pwd)/models:/app/models \
-            -v $(pwd)/results:/app/results \
-            edge-sim-x86 python benchmark.py --output results/x86_metrics.json
-
-      - name: Upload x86 Results
-        uses: actions/upload-artifact@v4
-        with:
-          name: x86-results
-          path: results/x86_metrics.json
-
-  benchmark-arm64:
-    name:  Real Edge Test (Raspberry Pi)
-    needs: setup-and-data
-    runs-on: [self-hosted, linux, arm64, raspberry-pi]
-    continue-on-error: true
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download Models
-        uses: actions/download-artifact@v4
-        with:
-          name: edge-models
-          path: models/
-
-      - name: Run Native Inference
-        run: |
-          mkdir -p results
-          python3 -m pip install tflite-runtime numpy opencv-python pandas tabulate
-          python3 benchmark.py --output results/arm64_metrics.json --device "Raspberry Pi"
-
-      - name: Upload ARM64 Results
-        uses: actions/upload-artifact@v4
-        with:
-          name: arm64-results
-          path: results/arm64_metrics.json
-
-  reporting-and-registration:
-    name:  Report & MLflow Staging
-    needs: [benchmark-x86, benchmark-arm64]
-    runs-on: ubuntu-latest
-    if: always()
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download All Results
-        uses: actions/download-artifact@v4
-        with:
-          path: all-results/
-
-      - name: Generate Consolidated Report
-        run: |
-          pip install pandas tabulate
-          # On utilise le script de génération de rapport
-          python scripts/generate_report.py \
-            --x86 all-results/x86-results/x86_metrics.json \
-            --arm64 all-results/arm64-results/arm64_metrics.json \
-            --output final_report.md
-
-      - name: Publish Report to PR
-        if: github.event_name == 'pull_request'
-        uses: thollander/actions-comment-pull-request@v2
-        with:
-          filePath: final_report.md
-
-      - name: Register to MLflow
-        if: github.ref == 'refs/heads/main' && success()
-        env:
-          MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
-        run: |
-          pip install mlflow
-          python scripts/register_model.py --stage "Staging"
+services:
+  # Notre "Faux Raspberry Pi"
+  edge-device:
+    build: .
+    container_name: raspberry_sim
+    ports:
+      - "8000:8000"
+    volumes:
+      # On lie les dossiers pour voir les logs ou changer les modèles depuis Windows
+      - ./models:/app/models
+      - ./data:/app/data
+    deploy:
+      resources:
+        limits:
+          # --- C'EST ICI QU'ON SIMULE LE PI ---
+          cpus: '0.50'     # 50% d'un seul cœur (votre PC en a 12 !)
+          memory: 512M     # 512 Mo de RAM (Comme un Pi Zero 2 ou un vieux Pi 3)
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=none # On force le CPU, on interdit le GPU NVIDIA
