@@ -3,6 +3,13 @@ name: MLOps Edge Security Pipeline - Feature Branch
 on:
   push:
     branches: [ feature/add ]
+    paths:
+      - 'app/**'
+      - 'models.dvc'
+      - 'data.dvc'
+      - 'scripts/**'
+      - 'requirements.txt'
+      - 'setup.py'
 
   workflow_dispatch:
     inputs:
@@ -22,7 +29,7 @@ env:
 
 jobs:
   setup-and-validation:
-    name: Setup et validation - Branche Feature
+    name: Setup and Validation
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -30,7 +37,7 @@ jobs:
       models_count: ${{ steps.check-models.outputs.count }}
       setup_success: ${{ steps.validate-setup.outputs.success }}
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -63,11 +70,11 @@ jobs:
           dvc remote modify --local "$REMOTE_NAME" gdrive_service_account_json_file_path ~/.dvc/gdrive_service_account.json
           dvc remote modify --local "$REMOTE_NAME" gdrive_acknowledge_abuse true
 
-      - name: DVC Pull models
+      - name: Pull models from DVC
         run: |
           dvc pull models.dvc --verbose
 
-      - name: Check models
+      - name: Check models presence
         id: check-models
         run: |
           if [ ! -d "models" ]; then
@@ -80,7 +87,7 @@ jobs:
           echo "exist=$([ $count -gt 0 ] && echo true || echo false)" >> $GITHUB_OUTPUT
           echo "count=$count" >> $GITHUB_OUTPUT
 
-      - name: Install package and validate
+      - name: Install package and validate loading
         id: validate-setup
         if: steps.check-models.outputs.exist == 'true'
         run: |
@@ -106,12 +113,12 @@ jobs:
           models = [f for f in os.listdir('models') if f.endswith('.tflite')]
           if models:
               detector = EdgeDetector(f"models/{models[0]}")
-              print("Model loaded successfully")
+              print("Model loaded successfully on x86")
           PY
           
           echo "success=true" >> $GITHUB_OUTPUT
 
-      - name: Basic tests
+      - name: Basic inference tests
         if: steps.check-models.outputs.exist == 'true' && steps.validate-setup.outputs.success == 'true'
         run: |
           python - << 'PY'
@@ -124,11 +131,11 @@ jobs:
               detector = EdgeDetector(f"models/{m}")
               img = np.random.randint(0, 255, (320, 320, 3), dtype=np.uint8)
               _, _, _, latency = detector.predict(img)
-              print(f"{m}: inference in {latency:.1f}ms")
+              print(f"{m}: inference latency {latency:.1f} ms")
           PY
 
   performance-benchmark:
-    name: Benchmark Performance
+    name: Performance Benchmark (x86)
     needs: setup-and-validation
     if: needs.setup-and-validation.outputs.models_exist == 'true' && needs.setup-and-validation.outputs.setup_success == 'true'
     runs-on: ubuntu-latest
@@ -136,7 +143,7 @@ jobs:
     outputs:
       production_ready_count: ${{ steps.run-benchmark.outputs.production_ready_count }}
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -144,25 +151,9 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install dependencies with proper order
+      - name: Install dependencies
         run: |
-          # Install tflite-runtime FIRST before anything else
-          pip install --upgrade pip
-          pip install tflite-runtime
-          
-          # Then install other dependencies
-          pip install opencv-python numpy pandas
-          
-          # Install DVC if needed
-          pip install "dvc[gdrive]==3.41.0"
-          
-          # Install requirements.txt if it exists (without installing package in editable mode)
-          if [ -f "requirements.txt" ]; then
-            pip install -r requirements.txt
-          fi
-          
-          # Verify tflite-runtime is installed
-          python -c "import tflite_runtime.interpreter as tflite; print('✓ tflite-runtime OK')"
+          pip install tflite-runtime opencv-python numpy pandas "dvc[gdrive]==3.41.0"
 
       - name: Configure DVC Service Account
         env:
@@ -179,222 +170,136 @@ jobs:
 
       - name: Pull models if needed
         run: |
-          # Add current directory to PYTHONPATH for importing app module
-          export PYTHONPATH="${PYTHONPATH}:$(pwd)"
-          echo "PYTHONPATH=$(pwd)" >> $GITHUB_ENV
-          
           if [ ! "$(ls -A models/*.tflite 2>/dev/null)" ]; then
             dvc pull models.dvc
           fi
 
-      - name: Run benchmark
+      - name: Run performance benchmark
         id: run-benchmark
         env:
           TF_ENABLE_ONEDNN_OPTS: "0"
         run: |
           cat > benchmark.py << 'EOF'
-          import os, json, numpy as np, time
-          
-          # Verify tflite-runtime import before anything else
-          try:
-              import tflite_runtime.interpreter as tflite
-              print("✓ tflite-runtime imported successfully")
-          except ImportError as e:
-              print(f"✗ Failed to import tflite-runtime: {e}")
-              raise
-          
+          import os
+          import json
+          import numpy as np
+          import time
           from app.inference import EdgeDetector
-          
-          print("🚀 Démarrage du benchmark de performance...")
           
           results = []
           model_files = [f for f in os.listdir('models') if f.endswith('.tflite')]
           
-          if not model_files:
-              print("⚠️ Aucun modèle .tflite trouvé dans le dossier models/")
-              with open('benchmark_results.json', 'w') as f:
-                  json.dump([], f)
-              exit(0)
-          
-          print(f"📊 {len(model_files)} modèle(s) détecté(s)")
-          
           for model_file in model_files:
-              print(f"\n🔍 Test du modèle: {model_file}")
               model_path = f"models/{model_file}"
+              detector = EdgeDetector(model_path)
+              test_img = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
               
-              try:
-                  detector = EdgeDetector(model_path)
-                  test_img = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-                  
-                  # Warm-up
-                  print("  ⏳ Warm-up (3 itérations)...")
-                  for _ in range(3): 
-                      detector.predict(test_img)
-                  
-                  # Benchmark
-                  print("  ⚡ Benchmark (15 itérations)...")
-                  latencies = []
-                  for i in range(15):
-                      start = time.perf_counter()
-                      _, _, _, latency = detector.predict(test_img)
-                      latencies.append(latency)
-                  
-                  avg = float(np.mean(latencies))
-                  p95 = float(np.percentile(latencies, 95))
-                  fps = 1000 / avg if avg > 0 else 0
-                  meets = bool(fps >= 15 and avg <= 100)  # Convert numpy.bool_ to Python bool
-                  
-                  result = {
-                      "model": model_file,
-                      "size_mb": round(os.path.getsize(model_path) / (1024*1024), 2),
-                      "avg_latency_ms": round(avg, 2),
-                      "p95_latency_ms": round(p95, 2),
-                      "fps": round(fps, 2),
-                      "meets_requirements": meets
-                  }
-                  results.append(result)
-                  
-                  status = "✅ PASS" if meets else "❌ FAIL"
-                  print(f"  {status} | Latence moy: {avg:.1f}ms | FPS: {fps:.1f} | Taille: {result['size_mb']}MB")
-                  
-              except Exception as e:
-                  print(f"  ❌ Erreur lors du test: {e}")
-                  results.append({
-                      "model": model_file,
-                      "error": str(e),
-                      "meets_requirements": False
-                  })
+              # Warm-up
+              for _ in range(3):
+                  detector.predict(test_img)
+              
+              # Benchmark
+              latencies = []
+              for _ in range(15):
+                  start = time.perf_counter()
+                  _, _, _, latency = detector.predict(test_img)
+                  latencies.append(latency)
+              
+              avg_latency = np.mean(latencies)
+              fps = 1000 / avg_latency if avg_latency > 0 else 0
+              meets_requirements = fps >= 15 and avg_latency <= 100
+              
+              results.append({
+                  "model": model_file,
+                  "size_mb": round(os.path.getsize(model_path) / (1024*1024), 2),
+                  "avg_latency_ms": round(avg_latency, 2),
+                  "fps": round(fps, 2),
+                  "meets_requirements": meets_requirements
+              })
           
-          # Save results
           with open('benchmark_results.json', 'w') as f:
               json.dump(results, f, indent=2)
           
-          ready_count = sum(1 for r in results if r.get("meets_requirements", False))
-          
-          print(f"\n📈 Résumé du benchmark:")
-          print(f"  - Total de modèles testés: {len(results)}")
-          print(f"  - Modèles prêts pour production: {ready_count}")
-          
-          # Output for GitHub Actions
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f"production_ready_count={ready_count}\n")
+          ready_count = sum(r["meets_requirements"] for r in results)
+          echo "production_ready_count=$ready_count" >> $GITHUB_OUTPUT
           EOF
           
           python benchmark.py
 
-      - name: Display benchmark summary
-        if: always()
-        run: |
-          if [ -f "benchmark_results.json" ]; then
-            echo "## 📊 Résultats du Benchmark" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            python - << 'PY'
-          import json
-          import sys
-          
-          try:
-              with open('benchmark_results.json') as f:
-                  results = json.load(f)
-          except Exception as e:
-              print(f"❌ Erreur lors de la lecture des résultats: {e}")
-              sys.exit(0)
-          
-          if not results:
-              print("Aucun résultat disponible")
-              sys.exit(0)
-          
-          print("| Modèle | Taille | Latence moy. | P95 | FPS | Production Ready |")
-          print("|--------|--------|--------------|-----|-----|------------------|")
-          for r in results:
-              if "error" in r:
-                  print(f"| {r['model']} | - | ERROR | - | - | ❌ |")
-              else:
-                  status = "✅" if r["meets_requirements"] else "❌"
-                  p95 = r.get('p95_latency_ms', '-')
-                  print(f"| {r['model']} | {r['size_mb']}MB | {r['avg_latency_ms']}ms | {p95}ms | {r['fps']} | {status} |")
-          PY
-          else
-            echo "⚠️ Aucun fichier de résultats trouvé" >> $GITHUB_STEP_SUMMARY
-          fi
-
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-feature-results
+          name: benchmark-x86-results
           path: benchmark_results.json
           retention-days: 7
 
-  mlflow-registration-staging:
-    name: Enregistrement MLflow - Staging
-    needs: performance-benchmark
-    if: success() && github.event.inputs.test_mode != 'benchmark-only'
+  raspberry-pi-simulation:
+    name: Raspberry Pi 4 Simulation (ARM64)
+    needs: setup-and-validation
+    if: needs.setup-and-validation.outputs.models_exist == 'true' && needs.setup-and-validation.outputs.setup_success == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Setup QEMU for ARM64 emulation
+        uses: docker/setup-qemu-action@v3
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          platforms: arm64
 
-      - name: Install dependencies with proper order
-        run: |
-          pip install --upgrade pip
-          pip install tflite-runtime
-          pip install mlflow pandas opencv-python numpy
-          pip install "dvc[gdrive]==3.41.0"
-          
-          # Install requirements.txt if it exists
-          if [ -f "requirements.txt" ]; then
-            pip install -r requirements.txt
-          fi
-          
-          # Verify installation
-          python -c "import tflite_runtime.interpreter as tflite; print('✓ tflite-runtime OK')"
-
-      - name: Configure DVC Service Account
-        env:
-          SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
-        run: |
-          mkdir -p ~/.dvc
-          echo "$SERVICE_ACCOUNT_JSON" > ~/.dvc/gdrive_service_account.json
-          
-          REMOTE_NAME=$(dvc remote list | head -n1 | awk '{print $1}' || echo "vdrive")
-          
-          dvc remote modify --local "$REMOTE_NAME" gdrive_use_service_account true
-          dvc remote modify --local "$REMOTE_NAME" gdrive_service_account_json_file_path ~/.dvc/gdrive_service_account.json
-          dvc remote modify --local "$REMOTE_NAME" gdrive_acknowledge_abuse true
-
-      - name: Pull models if needed
-        run: |
-          # Add current directory to PYTHONPATH for importing app module
-          export PYTHONPATH="${PYTHONPATH}:$(pwd)"
-          echo "PYTHONPATH=$(pwd)" >> $GITHUB_ENV
-          
-          if [ ! -d "models" ] || [ -z "$(ls models/*.tflite 2>/dev/null)" ]; then
-            dvc pull models.dvc
-          fi
-
-      - name: Run MLflow registration
-        env:
-          MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
-        run: |
-          echo "MLflow registration script here"
-          # Add your MLflow registration logic
-
-      - name: Upload MLflow report
-        uses: actions/upload-artifact@v4
+      - name: Run ARM64 container with Raspberry Pi-like environment
+        uses: addnab/docker-run-action@v3
         with:
-          name: mlflow-staging-reports
-          path: staging_registration_report.json
-          retention-days: 7
-        continue-on-error: true
+          image: python:3.11-slim
+          options: --platform linux/arm64 -v ${{ github.workspace }}:/workspace -w /workspace
+          run: |
+            apt-get update && apt-get install -y libatlas-base-dev libopencv-dev libjpeg-dev libpng-dev libtiff-dev libopenjp2-7-dev
+            pip install numpy opencv-python tflite-runtime
+            
+            # Copy models from host
+            cp -r models /workspace/models
+            
+            # Run inference test on simulated Raspberry Pi
+            python - << 'PY'
+            import numpy as np
+            from app.inference import EdgeDetector
+            import os
+            import time
+            
+            models = [f for f in os.listdir('models') if f.endswith('.tflite')]
+            if not models:
+                print("No model found")
+                exit(1)
+            
+            print(f"Testing on simulated Raspberry Pi 4 (ARM64): {models[0]}")
+            
+            detector = EdgeDetector(f"models/{models[0]}")
+            
+            test_img = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+            
+            # Warm-up
+            for _ in range(5):
+                detector.predict(test_img)
+            
+            # Measure latency
+            latencies = []
+            for _ in range(20):
+                start = time.perf_counter()
+                _, _, _, latency = detector.predict(test_img)
+                latencies.append(latency * 1000)  # ms
+            
+            avg_ms = sum(latencies) / len(latencies)
+            fps = 1000 / avg_ms if avg_ms > 0 else 0
+            
+            print(f"Average inference latency: {avg_ms:.1f} ms")
+            print(f"Estimated FPS: {fps:.1f}")
+            print(f"Target met (>=15 FPS): {'Yes' if fps >= 15 else 'No'}")
+            PY
 
   final-report:
-    name: Rapport Final
-    needs: [setup-and-validation, performance-benchmark, mlflow-registration-staging]
+    name: Final Report
+    needs: [setup-and-validation, performance-benchmark, raspberry-pi-simulation]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -404,32 +309,36 @@ jobs:
           pattern: '*'
           path: artifacts
           merge-multiple: true
-        continue-on-error: true
 
       - name: Generate final report
         run: |
-          echo "# 📋 Rapport Final - Feature Pipeline" > final_feature_report.md
-          echo "" >> final_feature_report.md
-          echo "**Date**: $(date)" >> final_feature_report.md
-          echo "**Branche**: ${{ github.ref_name }}" >> final_feature_report.md
-          echo "" >> final_feature_report.md
+          cat > final_report.md << 'EOF'
+          # MLOps Pipeline Report - Feature Branch
+
+          Date: $(date)
+          Branch: ${{ github.ref_name }}
+          Commit: ${{ github.sha }}
+
+          ## Validation Status
+          - Models detected: ${{ needs.setup-and-validation.outputs.models_count }}
+          - Validation: ${{ needs.setup-and-validation.result }}
+
+          ## x86 Benchmark
+          - Status: ${{ needs.performance-benchmark.result }}
+          - Production ready models: ${{ needs.performance-benchmark.outputs.production_ready_count }}
+
+          ## Raspberry Pi 4 Simulation (ARM64)
+          - Status: ${{ needs.raspberry-pi-simulation.result }}
+          - Inference tested on emulated ARM64 environment
+
+          Pipeline completed.
+          EOF
           
-          if [ -f "artifacts/benchmark_results.json" ]; then
-            echo "## Résultats du Benchmark" >> final_feature_report.md
-            python - << 'PY'
-          import json
-          with open('artifacts/benchmark_results.json') as f:
-              results = json.load(f)
-          ready = sum(r.get("meets_requirements", False) for r in results)
-          print(f"- **Modèles testés**: {len(results)}")
-          print(f"- **Modèles production-ready**: {ready}")
-          PY
-          fi
+          cat final_report.md
 
       - name: Upload final report
         uses: actions/upload-artifact@v4
         with:
-          name: feature-pipeline-final-report
-          path: final_feature_report.md
+          name: final-pipeline-report
+          path: final_report.md
           retention-days: 30
-        continue-on-error: true
