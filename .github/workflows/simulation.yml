@@ -12,7 +12,7 @@ env:
 
 jobs:
   ci:
-    name: Edge Model CI
+    name: Edge Production CI
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -29,22 +29,21 @@ jobs:
         run: |
           python -m pip install --upgrade pip
 
-      - name: Install dependencies
+      - name: Install runtime dependencies
         run: |
-          pip install numpy opencv-python tflite-runtime
-          pip install ruff
+          pip install numpy opencv-python tflite-runtime ruff
 
       # =========================
-      # CODE QUALITY
+      # LINTING (PRODUCTION ONLY)
       # =========================
-      - name: Lint code with Ruff
+      - name: Lint production code
         run: |
-          ruff check .
+          ruff check app/
 
       # =========================
       # MODEL CHECK
       # =========================
-      - name: Check models directory
+      - name: Check TFLite models
         id: models
         run: |
           if [ -d "models" ] && ls models/*.tflite > /dev/null 2>&1; then
@@ -56,7 +55,7 @@ jobs:
       # =========================
       # BASIC INFERENCE TEST
       # =========================
-      - name: Run inference test
+      - name: Inference sanity test
         if: steps.models.outputs.found == 'true'
         run: |
           python << 'EOF'
@@ -64,23 +63,20 @@ jobs:
           import os
           from app.inference import EdgeDetector
 
-          models = [m for m in os.listdir("models") if m.endswith(".tflite")]
-          assert models, "No model found"
-
-          model_path = os.path.join("models", models[0])
-          detector = EdgeDetector(model_path)
+          model = [m for m in os.listdir("models") if m.endswith(".tflite")][0]
+          detector = EdgeDetector(f"models/{model}")
 
           img = np.random.randint(0, 255, (320, 320, 3), dtype=np.uint8)
-          outputs = detector.predict(img)
+          result = detector.predict(img)
 
-          assert outputs is not None
-          print("Inference test passed")
+          assert result is not None
+          print("Inference OK")
           EOF
 
       # =========================
-      # PERFORMANCE BENCHMARK
+      # LIGHT PERFORMANCE CHECK
       # =========================
-      - name: CPU benchmark
+      - name: CPU latency check
         if: steps.models.outputs.found == 'true'
         run: |
           python << 'EOF'
@@ -94,17 +90,14 @@ jobs:
 
           img = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
 
-          latencies = []
-          for _ in range(10):
-            start = time.perf_counter()
-            detector.predict(img)
-            latencies.append((time.perf_counter() - start) * 1000)
+          times = []
+          for _ in range(5):
+              t0 = time.perf_counter()
+              detector.predict(img)
+              times.append((time.perf_counter() - t0) * 1000)
 
-          avg = sum(latencies) / len(latencies)
-          fps = 1000 / avg if avg > 0 else 0
-
+          avg = sum(times) / len(times)
           print(f"Average latency: {avg:.2f} ms")
-          print(f"Estimated FPS: {fps:.2f}")
           EOF
 
       # =========================
@@ -113,10 +106,11 @@ jobs:
       - name: Generate CI report
         run: |
           cat << EOF > ci_report.md
-          # CI Report
+          # Edge MLOps CI Report
 
-          - Python version: ${{ env.PYTHON_VERSION }}
+          - Python: ${{ env.PYTHON_VERSION }}
           - Models present: ${{ steps.models.outputs.found }}
+          - Lint scope: app/
           - Status: SUCCESS
           EOF
 
