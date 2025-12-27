@@ -15,7 +15,9 @@ on:
         required: false
         default: "true"
         type: choice
-        options: ["true", "false"]
+        options:
+          - "true"
+          - "false"
 
 env:
   PYTHON_VERSION: "3.11"
@@ -36,9 +38,11 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
@@ -46,11 +50,13 @@ jobs:
         run: |
           pip install ruff bandit
 
-      - name: Lint code
-        run: ruff app/
+      - name: Lint code with Ruff
+        run: |
+          ruff check app/ scripts/
 
-      - name: Static security analysis
-        run: bandit -r app/ -ll
+      - name: Static security analysis with Bandit
+        run: |
+          bandit -r app/ -ll
 
 # ============================================================
 # 2. DATA & MODEL VALIDATION (DVC)
@@ -65,14 +71,17 @@ jobs:
       models_exist: ${{ steps.check-models.outputs.exist }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install DVC
-        run: pip install "dvc[gdrive]==3.41.0"
+        run: |
+          pip install "dvc[gdrive]==3.41.0"
 
       - name: Configure DVC credentials
         env:
@@ -82,11 +91,13 @@ jobs:
           echo "$GDRIVE_JSON" > ~/.dvc/gdrive.json
           dvc remote modify --local $DVC_REMOTE_NAME gdrive_use_service_account true
           dvc remote modify --local $DVC_REMOTE_NAME gdrive_service_account_json_file_path ~/.dvc/gdrive.json
+          dvc remote modify --local $DVC_REMOTE_NAME gdrive_acknowledge_abuse true
 
-      - name: Pull models
-        run: dvc pull models.dvc
+      - name: Pull models from DVC
+        run: |
+          dvc pull models.dvc
 
-      - name: Check models
+      - name: Check models presence
         id: check-models
         run: |
           count=$(ls models/*.tflite 2>/dev/null | wc -l)
@@ -107,27 +118,35 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install dependencies
-        run: pip install numpy opencv-python tflite-runtime
+      - name: Install runtime dependencies
+        run: |
+          pip install numpy opencv-python tflite-runtime
 
-      - name: Run inference test
+      - name: Run inference functional test
         run: |
           python - << 'EOF'
-          import numpy as np, os
+          import os
+          import numpy as np
           from app.inference import EdgeDetector
 
-          model = [f for f in os.listdir("models") if f.endswith(".tflite")][0]
-          detector = EdgeDetector(f"models/{model}")
-          img = np.random.randint(0,255,(320,320,3),dtype=np.uint8)
-          _,_,_,lat = detector.predict(img)
-          assert lat < 300, "Latency too high"
-          print("Functional test passed")
+          models = [f for f in os.listdir("models") if f.endswith(".tflite")]
+          if not models:
+              raise RuntimeError("No model found")
+
+          detector = EdgeDetector(f"models/{models[0]}")
+          img = np.random.randint(0, 255, (320, 320, 3), dtype=np.uint8)
+          _, _, _, latency = detector.predict(img)
+
+          assert latency < 300, f"Latency too high: {latency} ms"
+          print("Functional inference test passed")
           EOF
 
 # ============================================================
@@ -143,19 +162,23 @@ jobs:
       fps_ok: ${{ steps.evaluate.outputs.fps_ok }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install dependencies
-        run: pip install numpy tflite-runtime pandas
+      - name: Install benchmark dependencies
+        run: |
+          pip install numpy pandas tflite-runtime jq bc
 
       - name: Run benchmark
-        run: python scripts/benchmark.py
+        run: |
+          python scripts/benchmark.py
 
-      - name: Evaluate results
+      - name: Evaluate benchmark results
         id: evaluate
         run: |
           fps=$(jq '.[0].fps' benchmark_results.json)
@@ -166,7 +189,8 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload benchmark artifact
+        uses: actions/upload-artifact@v4
         with:
           name: benchmark-x86
           path: benchmark_results.json
@@ -182,13 +206,15 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: docker/setup-qemu-action@v3
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
         with:
           platforms: arm64
 
-      - name: ARM64 inference test
+      - name: Run ARM64 inference test
         run: |
           docker run --rm --platform linux/arm64 \
             -v $PWD:/app -w /app python:3.11-slim \
@@ -198,7 +224,7 @@ jobs:
             "
 
 # ============================================================
-# 6. MODEL PROMOTION (MLOps GATING)
+# 6. MODEL PROMOTION (MAIN BRANCH ONLY)
 # ============================================================
   model-promotion:
     name: Model Promotion
@@ -208,19 +234,19 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Promote model
         run: |
-          echo "Model validated and promoted to production"
           git tag model-production-$(date +%Y%m%d%H%M)
           git push --tags
 
 # ============================================================
-# 7. FINAL REPORT
+# 7. FINAL CI/CD REPORT
 # ============================================================
   final-report:
-    name: CI/CD Final Report
+    name: Final CI/CD Report
     runs-on: ubuntu-latest
     needs:
       - code-quality
@@ -236,6 +262,7 @@ jobs:
         run: |
           cat << EOF > ci_cd_report.md
           # Edge AI MLOps CI/CD Report
+
           Commit: ${{ github.sha }}
           Branch: ${{ github.ref_name }}
 
@@ -247,7 +274,8 @@ jobs:
           - Model Promotion: ${{ needs.model-promotion.result }}
           EOF
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload CI/CD report
+        uses: actions/upload-artifact@v4
         with:
           name: ci-cd-report
           path: ci_cd_report.md
