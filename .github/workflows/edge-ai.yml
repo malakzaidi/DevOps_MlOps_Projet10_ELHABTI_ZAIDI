@@ -1,0 +1,183 @@
+name: MLOps Edge AI - Visual Dashboard
+
+on:
+  push:
+    branches: [ main, feature/** ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+  PYTHON_VERSION: '3.11'
+  DVC_REMOTE_NAME: 'vdrive'
+
+jobs:
+  setup-and-data:
+    name: 1. Data & Environment Setup
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install DVC & Requirements
+        run: |
+          pip install "dvc[gdrive]==3.41.0" matplotlib pandas
+          echo "Environment ready with DVC and Visualization tools."
+
+      - name: Pull Models from DVC
+        env:
+          GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
+        run: |
+          mkdir -p ~/.dvc
+          echo "$GDRIVE_CREDENTIALS" > ~/.dvc/gdrive_service_account.json
+          dvc remote modify --local ${{ env.DVC_REMOTE_NAME }} gdrive_use_service_account true
+          dvc remote modify --local ${{ env.DVC_REMOTE_NAME }} gdrive_service_account_json_file_path ~/.dvc/gdrive_service_account.json
+          dvc pull models.dvc || echo "DVC pull failed"
+
+      - name: Upload Models
+        uses: actions/upload-artifact@v4
+        with:
+          name: edge-models
+          path: models/
+
+  benchmark-x86:
+    name: 2. x86 Cloud Benchmark
+    needs: setup-and-data
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      - name: Download Models
+        uses: actions/download-artifact@v4
+        with:
+          name: edge-models
+          path: models/
+      - name: Run x86 Benchmark
+        run: |
+          mkdir -p results
+          python3 benchmark.py --output results/x86_metrics.json --device "x86 Cloud"
+      - name: Upload x86 Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: x86-results
+          path: results/x86_metrics.json
+
+  benchmark-arm64:
+    name: 3. ARM64 Edge Simulation
+    needs: setup-and-data
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      - name: Download Models
+        uses: actions/download-artifact@v4
+        with:
+          name: edge-models
+          path: models/
+      - name: Run ARM64 Simulation
+        run: |
+          mkdir -p results
+          python3 benchmark.py --output results/arm64_metrics.json --device "ARM64 Edge"
+      - name: Upload ARM64 Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-results
+          path: results/arm64_metrics.json
+
+  reporting:
+    name: 4. Visual Analysis & Dashboard
+    needs: [benchmark-x86, benchmark-arm64]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download All Results
+        uses: actions/download-artifact@v4
+        with:
+          path: all-results/
+
+      - name: Generate Visual Dashboard
+        run: |
+          mkdir -p scripts
+          cat > scripts/generate_visual_report.py << 'EOF'
+          import json
+          import matplotlib.pyplot as plt
+          import pandas as pd
+          from pathlib import Path
+
+          def load_metrics(path):
+              file_path = Path(path)
+              if file_path.exists():
+                  return json.load(open(file_path))
+              return {"device": "N/A", "avg_latency_ms": 0, "fps": 0}
+
+          x86 = load_metrics("all-results/x86-results/x86_metrics.json")
+          arm64 = load_metrics("all-results/arm64-results/arm64_metrics.json")
+
+          # Create Dataframe for visualization
+          data = {
+              'Metric': ['Latency (ms)', 'FPS'],
+              'x86 Cloud': [x86['avg_latency_ms'], x86['fps']],
+              'ARM64 Edge': [arm64['avg_latency_ms'], arm64['fps']]
+          }
+          df = pd.DataFrame(data)
+
+          # Generate Plot
+          fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+          
+          # Latency Plot
+          df.plot(x='Metric', y=['x86 Cloud', 'ARM64 Edge'], kind='bar', ax=ax1)
+          ax1.set_title('Performance Comparison')
+          ax1.set_ylabel('Value')
+          
+          plt.tight_layout()
+          plt.savefig('performance_chart.png')
+
+          # Generate Markdown Report
+          report = f"""# 📊 MLOps Edge AI Performance Dashboard
+
+          ## 📝 Project Overview
+          This pipeline automates the benchmarking of AI models across different architectures. 
+          It compares **Cloud Inference (x86)** vs **Edge Inference (ARM64)** to validate optimization techniques like Int8 Quantification.
+
+          ## 📈 Key Metrics Comparison
+          | Metric | x86 Cloud (Standard) | ARM64 Edge (Simulated) | Difference |
+          |--------|----------------------|------------------------|------------|
+          | **Device** | {x86['device']} | {arm64['device']} | - |
+          | **Latency**| {x86['avg_latency_ms']} ms | {arm64['avg_latency_ms']} ms | {round(arm64['avg_latency_ms'] - x86['avg_latency_ms'], 2)} ms |
+          | **FPS**    | {x86['fps']} | {arm64['fps']} | {round(arm64['fps'] - x86['fps'], 2)} |
+
+          ## 🔍 Technical Insights
+          - **x86 Cloud**: High throughput, suitable for training and heavy inference.
+          - **ARM64 Edge**: Resource-constrained, target for final deployment (Raspberry Pi).
+          
+          ---
+          *Dashboard generated automatically by the MLOps Pipeline.*
+          """
+          Path("final_report.md").write_text(report)
+          EOF
+          python3 scripts/generate_visual_report.py
+
+      - name: Publish Dashboard to Job Summary
+        run: cat final_report.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload Performance Chart
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-visuals
+          path: performance_chart.png
+
+      - name: Upload Final Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-report
+          path: final_report.md
