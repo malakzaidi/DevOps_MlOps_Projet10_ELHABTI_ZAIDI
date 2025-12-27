@@ -2,9 +2,9 @@ name: MLOps Edge AI - Visual Dashboard Fixed
 
 on:
   push:
-    branches: [ main, feature/** ]
+    branches: [ feature/add ]
   pull_request:
-    branches: [ main ]
+    branches: [ feature/add ]
   workflow_dispatch:
 
 env:
