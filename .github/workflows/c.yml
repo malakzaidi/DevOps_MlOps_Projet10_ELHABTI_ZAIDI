@@ -239,10 +239,10 @@ jobs:
                       _, _, _, latency = detector.predict(test_img)
                       latencies.append(latency)
                   
-                  avg = np.mean(latencies)
-                  p95 = np.percentile(latencies, 95)
+                  avg = float(np.mean(latencies))
+                  p95 = float(np.percentile(latencies, 95))
                   fps = 1000 / avg if avg > 0 else 0
-                  meets = fps >= 15 and avg <= 100
+                  meets = bool(fps >= 15 and avg <= 100)  # Convert numpy.bool_ to Python bool
                   
                   result = {
                       "model": model_file,
@@ -269,7 +269,7 @@ jobs:
           with open('benchmark_results.json', 'w') as f:
               json.dump(results, f, indent=2)
           
-          ready_count = sum(r.get("meets_requirements", False) for r in results)
+          ready_count = sum(1 for r in results if r.get("meets_requirements", False))
           
           print(f"\n📈 Résumé du benchmark:")
           print(f"  - Total de modèles testés: {len(results)}")
@@ -290,22 +290,31 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
             python - << 'PY'
           import json
-          with open('benchmark_results.json') as f:
-              results = json.load(f)
+          import sys
+          
+          try:
+              with open('benchmark_results.json') as f:
+                  results = json.load(f)
+          except Exception as e:
+              print(f"❌ Erreur lors de la lecture des résultats: {e}")
+              sys.exit(0)
           
           if not results:
               print("Aucun résultat disponible")
-              exit(0)
+              sys.exit(0)
           
-          print("| Modèle | Taille | Latence moy. | FPS | Production Ready |")
-          print("|--------|--------|--------------|-----|------------------|")
+          print("| Modèle | Taille | Latence moy. | P95 | FPS | Production Ready |")
+          print("|--------|--------|--------------|-----|-----|------------------|")
           for r in results:
               if "error" in r:
-                  print(f"| {r['model']} | - | ERROR | - | ❌ |")
+                  print(f"| {r['model']} | - | ERROR | - | - | ❌ |")
               else:
                   status = "✅" if r["meets_requirements"] else "❌"
-                  print(f"| {r['model']} | {r['size_mb']}MB | {r['avg_latency_ms']}ms | {r['fps']} | {status} |")
+                  p95 = r.get('p95_latency_ms', '-')
+                  print(f"| {r['model']} | {r['size_mb']}MB | {r['avg_latency_ms']}ms | {p95}ms | {r['fps']} | {status} |")
           PY
+          else
+            echo "⚠️ Aucun fichier de résultats trouvé" >> $GITHUB_STEP_SUMMARY
           fi
 
       - name: Upload benchmark results
