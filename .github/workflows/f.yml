@@ -1,0 +1,303 @@
+name: MLOps Edge Security Pipeline - Feature Branch
+
+on:
+  push:
+    branches: [ feature/add ]
+    paths:
+      - 'app/**'
+      - 'models.dvc'
+      - 'data.dvc'
+      - 'scripts/**'
+      - 'requirements.txt'
+      - 'setup.py'
+
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: 'Mode de test détaillé'
+        required: false
+        default: 'basic'
+        type: choice
+        options:
+          - basic
+          - full
+          - benchmark-only
+
+env:
+  MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI || 'http://localhost:5000' }}
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  setup-and-validation:
+    name: Setup et validation - Branche Feature
+    runs-on: ubuntu-latest-4-cores
+    timeout-minutes: 15
+    outputs:
+      models_exist: ${{ steps.check-models.outputs.exist }}
+      models_count: ${{ steps.check-models.outputs.count }}
+      setup_success: ${{ steps.validate-setup.outputs.success }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install DVC and dependencies
+        run: |
+          pip install "dvc[gdrive]==3.41.0"
+          pip install opencv-python numpy tflite-runtime
+
+      - name: Configure DVC Service Account
+        env:
+          SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
+        run: |
+          if [ -z "$SERVICE_ACCOUNT_JSON" ]; then
+            echo "Error: GDRIVE_CREDENTIALS_JSON secret missing"
+            exit 1
+          fi
+          
+          mkdir -p ~/.dvc
+          echo "$SERVICE_ACCOUNT_JSON" > ~/.dvc/gdrive_service_account.json
+          
+          REMOTE_NAME=$(dvc remote list | head -n1 | awk '{print $1}' || echo "vdrive")
+          
+          dvc remote modify --local "$REMOTE_NAME" gdrive_use_service_account true
+          dvc remote modify --local "$REMOTE_NAME" gdrive_service_account_json_file_path ~/.dvc/gdrive_service_account.json
+          dvc remote modify --local "$REMOTE_NAME" gdrive_acknowledge_abuse true
+
+      - name: DVC Pull models
+        run: |
+          dvc pull models.dvc --verbose
+
+      - name: Check models
+        id: check-models
+        run: |
+          if [ ! -d "models" ]; then
+            echo "exist=false" >> $GITHUB_OUTPUT
+            echo "count=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          count=$(find models -name "*.tflite" -type f | wc -l)
+          echo "exist=$([ $count -gt 0 ] && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "count=$count" >> $GITHUB_OUTPUT
+
+      - name: Install package and validate
+        id: validate-setup
+        if: steps.check-models.outputs.exist == 'true'
+        run: |
+          if [ ! -f "setup.py" ]; then
+            cat > setup.py << 'EOF'
+          from setuptools import setup, find_packages
+          setup(
+              name="edge_security_feature",
+              version="0.1.0",
+              packages=find_packages(),
+              install_requires=['opencv-python', 'numpy', 'tflite-runtime'],
+              python_requires='>=3.8',
+          )
+          EOF
+          fi
+          
+          pip install -e .
+          [ -f "requirements.txt" ] && pip install -r requirements.txt
+          
+          python - << 'PY'
+          from app.inference import EdgeDetector
+          import os
+          models = [f for f in os.listdir('models') if f.endswith('.tflite')]
+          if models:
+              detector = EdgeDetector(f"models/{models[0]}")
+              print("Model loaded successfully")
+          PY
+          
+          echo "success=true" >> $GITHUB_OUTPUT
+
+      - name: Basic tests
+        if: steps.check-models.outputs.exist == 'true' && steps.validate-setup.outputs.success == 'true'
+        run: |
+          python - << 'PY'
+          import numpy as np
+          from app.inference import EdgeDetector
+          import os
+          
+          models = [f for f in os.listdir('models') if f.endswith('.tflite')][:2]
+          for m in models:
+              detector = EdgeDetector(f"models/{m}")
+              img = np.random.randint(0, 255, (320, 320, 3), dtype=np.uint8)
+              _, _, _, latency = detector.predict(img)
+              print(f"{m}: inference in {latency:.1f}ms")
+          PY
+
+  performance-benchmark:
+    name: Benchmark Performance
+    needs: setup-and-validation
+    if: needs.setup-and-validation.outputs.models_exist == 'true' && needs.setup-and-validation.outputs.setup_success == 'true'
+    runs-on: ubuntu-latest-4-cores
+    timeout-minutes: 20
+    outputs:
+      production_ready_count: ${{ steps.run-benchmark.outputs.production_ready_count }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies including tflite-runtime
+        run: |
+          pip install opencv-python numpy pandas tflite-runtime
+          pip install -e .
+
+      - name: Configure DVC Service Account
+        env:
+          SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
+        run: |
+          mkdir -p ~/.dvc
+          echo "$SERVICE_ACCOUNT_JSON" > ~/.dvc/gdrive_service_account.json
+          
+          REMOTE_NAME=$(dvc remote list | head -n1 | awk '{print $1}' || echo "vdrive")
+          
+          dvc remote modify --local "$REMOTE_NAME" gdrive_use_service_account true
+          dvc remote modify --local "$REMOTE_NAME" gdrive_service_account_json_file_path ~/.dvc/gdrive_service_account.json
+          dvc remote modify --local "$REMOTE_NAME" gdrive_acknowledge_abuse true
+
+      - name: Pull models if needed
+        run: |
+          if [ ! "$(ls -A models/*.tflite 2>/dev/null)" ]; then
+            dvc pull models.dvc
+          fi
+
+      - name: Run benchmark
+        id: run-benchmark
+        env:
+          TF_ENABLE_ONEDNN_OPTS: "0"
+        run: |
+          cat > benchmark.py << 'EOF'
+          import os, json, numpy as np, time
+          from app.inference import EdgeDetector
+          
+          results = []
+          for model_file in os.listdir('models'):
+              if not model_file.endswith('.tflite'): continue
+              model_path = f"models/{model_file}"
+              detector = EdgeDetector(model_path)
+              test_img = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+              for _ in range(3): detector.predict(test_img)  # warm-up
+              
+              latencies = []
+              for _ in range(15):
+                  start = time.perf_counter()
+                  _, _, _, latency = detector.predict(test_img)
+                  latencies.append(latency)
+              
+              avg = np.mean(latencies)
+              fps = 1000 / avg if avg > 0 else 0
+              meets = fps >= 15 and avg <= 100
+              
+              results.append({
+                  "model": model_file,
+                  "size_mb": round(os.path.getsize(model_path) / (1024*1024), 2),
+                  "avg_latency_ms": round(avg, 2),
+                  "fps": round(fps, 2),
+                  "meets_requirements": meets
+              })
+          
+          with open('benchmark_results.json', 'w') as f:
+              json.dump(results, f, indent=2)
+          
+          ready_count = sum(r["meets_requirements"] for r in results)
+          echo "production_ready_count=$ready_count" >> $GITHUB_OUTPUT
+          EOF
+          
+          python benchmark.py
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-feature-results
+          path: benchmark_results.json
+          retention-days: 7
+
+  mlflow-registration-staging:
+    name: Enregistrement MLflow - Staging
+    needs: performance-benchmark
+    if: success() && github.event.inputs.test_mode != 'benchmark-only'
+    runs-on: ubuntu-latest-4-cores
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install mlflow pandas tflite-runtime
+          pip install -e .
+
+      - name: Configure DVC Service Account
+        env:
+          SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
+        run: |
+          mkdir -p ~/.dvc
+          echo "$SERVICE_ACCOUNT_JSON" > ~/.dvc/gdrive_service_account.json
+          
+          REMOTE_NAME=$(dvc remote list | head -n1 | awk '{print $1}' || echo "vdrive")
+          
+          dvc remote modify --local "$REMOTE_NAME" gdrive_use_service_account true
+          dvc remote modify --local "$REMOTE_NAME" gdrive_service_account_json_file_path ~/.dvc/gdrive_service_account.json
+          dvc remote modify --local "$REMOTE_NAME" gdrive_acknowledge_abuse true
+
+      - name: Pull models if needed
+        run: |
+          if [ ! -d "models" ] || [ -z "$(ls models/*.tflite 2>/dev/null)" ]; then
+            dvc pull models.dvc
+          fi
+
+      - name: Run MLflow registration
+        env:
+          MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
+        run: |
+          # Ton script register_staging.py ici (ou garde-le comme avant)
+
+      - name: Upload MLflow report
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlflow-staging-reports
+          path: staging_registration_report.json
+          retention-days: 7
+
+  final-report:
+    name: Rapport Final
+    needs: [setup-and-validation, performance-benchmark, mlflow-registration-staging]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*'
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate final report
+        run: |
+          # Ton script de rapport ici (ou garde-le comme avant)
+
+      - name: Upload final report
+        uses: actions/upload-artifact@v4
+        with:
+          name: feature-pipeline-final-report
+          path: final_feature_report.md
+          retention-days: 30
